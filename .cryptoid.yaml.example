@@ -1,0 +1,22 @@
+# Cryptoid Configuration Example (v2 multi-user)
+# Copy this to .cryptoid.yaml and customize for your site.
+# IMPORTANT: Add .cryptoid.yaml to your .gitignore!
+
+# User credentials
+# Each user gets their own username:password pair for browser login.
+users:
+  alice: "change-this-to-a-strong-passphrase"
+  bob: "another-strong-passphrase"
+  carol: "yet-another-passphrase"
+
+# Groups
+# Map group names to lists of usernames.
+# The special "admin" group gets access to ALL encrypted content.
+groups:
+  admin: [alice]
+  team: [alice, bob, carol]
+  members: [bob, carol]
+
+# Optional: Shared PBKDF2 salt (32 hex chars = 16 bytes)
+# If omitted, a random salt is generated per encryption.
+# salt: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
