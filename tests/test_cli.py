@@ -1341,3 +1341,71 @@ groups:
 
         assert result.exit_code == 0
         assert "no errors or warnings" in result.output.lower()
+
+
+# =============================================================================
+# Shortcode attribute escaping tests
+# =============================================================================
+
+
+class TestShortcodeQuoteEscaping:
+    """Test that double quotes in password hints don't break shortcodes."""
+
+    def test_encrypt_file_with_quotes_in_hint(self, tmp_path):
+        """Password hint with double quotes doesn't break shortcode."""
+        md_file = tmp_path / "test.md"
+        md_file.write_text("""---
+title: "Test"
+encrypted: true
+password_hint: 'say "hello" to proceed'
+---
+
+Secret content here.
+""")
+        users = {"alice": "password123"}
+        result = encrypt_file(md_file, users)
+
+        assert result is True
+        content = md_file.read_text()
+        assert is_already_encrypted(content)
+        # Quotes should be stripped from hint
+        assert 'hint="say hello to proceed"' in content
+        # No unescaped quotes that would break the shortcode
+        assert 'hint="say "hello"' not in content
+
+    def test_encrypt_decrypt_roundtrip_with_quotes_in_hint(self, tmp_path):
+        """Full encrypt/decrypt roundtrip works with quotes in hint."""
+        md_file = tmp_path / "test.md"
+        md_file.write_text("""---
+title: "Test"
+encrypted: true
+password_hint: 'He said "password123"'
+---
+
+Secret content here.
+""")
+        users = {"alice": "password123"}
+        encrypt_file(md_file, users)
+
+        assert is_already_encrypted(md_file.read_text())
+
+        result = decrypt_file(md_file, users)
+        assert result is True
+        content = md_file.read_text()
+        assert "Secret content here" in content
+
+    def test_encrypt_file_hint_without_quotes(self, tmp_path):
+        """Normal hints (no quotes) are unchanged."""
+        md_file = tmp_path / "test.md"
+        md_file.write_text("""---
+title: "Test"
+encrypted: true
+password_hint: "A normal hint"
+---
+
+Secret content.
+""")
+        users = {"alice": "password123"}
+        encrypt_file(md_file, users)
+        content = md_file.read_text()
+        assert 'hint="A normal hint"' in content

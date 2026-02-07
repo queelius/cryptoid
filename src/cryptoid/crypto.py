@@ -87,7 +87,7 @@ def _unwrap_key(iv: bytes, ct: bytes, wrapping_key: bytes) -> bytes | None:
     aesgcm = AESGCM(wrapping_key)
     try:
         return aesgcm.decrypt(iv, ct, None)
-    except (InvalidTag, Exception):
+    except InvalidTag:
         return None
 
 

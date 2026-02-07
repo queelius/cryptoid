@@ -222,6 +222,27 @@
   }
 
   /**
+   * Check if a URL is safe for use in href attributes.
+   * Allows http:, https:, mailto:, and relative URLs.
+   */
+  function isSafeUrl(url) {
+    const trimmed = url.trim().toLowerCase();
+    if (
+      trimmed.startsWith("http:") ||
+      trimmed.startsWith("https:") ||
+      trimmed.startsWith("mailto:")
+    ) {
+      return true;
+    }
+    // Block URLs with explicit schemes (e.g., javascript:, data:, vbscript:)
+    if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) {
+      return false;
+    }
+    // Allow relative URLs (no scheme)
+    return true;
+  }
+
+  /**
    * Render decrypted markdown as HTML.
    * Uses a simple markdown-to-HTML conversion for basic formatting.
    */
@@ -242,8 +263,13 @@
       .replace(/\*(.+?)\*/g, "<em>$1</em>")
       // Inline code
       .replace(/`([^`]+)`/g, "<code>$1</code>")
-      // Links
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
+      // Links (with URL scheme validation)
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (match, text, url) {
+        if (isSafeUrl(url)) {
+          return '<a href="' + url + '">' + text + "</a>";
+        }
+        return text;
+      })
       // Line breaks and paragraphs
       .replace(/\n\n+/g, "</p><p>")
       .replace(/\n/g, "<br>");
@@ -304,8 +330,23 @@
       contentDiv.style.display = "block";
       form.style.display = "none";
     } catch (e) {
-      // Show error
-      errorDiv.textContent = "Incorrect username or password. Please try again.";
+      // Show error — distinguish format errors from wrong credentials
+      let message;
+      if (
+        e.message &&
+        (e.message.includes("Unsupported format") ||
+          e.message.includes("JSON") ||
+          e.message.includes("atob"))
+      ) {
+        message =
+          "Unable to decrypt: the encrypted data appears to be corrupted.";
+      } else if (e.message && e.message.includes("hash mismatch")) {
+        message =
+          "Decryption succeeded but content integrity check failed. The data may be corrupted.";
+      } else {
+        message = "Incorrect username or password. Please try again.";
+      }
+      errorDiv.textContent = message;
       errorDiv.style.display = "block";
       passwordInput.value = "";
       passwordInput.focus();
@@ -317,8 +358,10 @@
   /**
    * Auto-decrypt containers with saved credentials on page load.
    */
-  function autoDecrypt() {
-    document.querySelectorAll(".cryptoid-container").forEach(async (container) => {
+  async function autoDecrypt() {
+    const containers = document.querySelectorAll(".cryptoid-container");
+
+    for (const container of containers) {
       const containerId = container.id;
       const saved = getSavedCredentials(containerId);
 
@@ -340,6 +383,7 @@
             }
           }
 
+          // Content is safe: renderContent() escapes HTML before building markup
           contentDiv.innerHTML = renderContent(plaintext);
           contentDiv.style.display = "block";
           form.style.display = "none";
@@ -348,7 +392,7 @@
           clearSavedCredentials(containerId);
         }
       }
-    });
+    }
   }
 
   // Auto-decrypt on page load

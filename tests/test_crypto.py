@@ -482,3 +482,30 @@ class TestContentHash:
         assert h1 != h2
         assert h1 != h3
         assert h2 != h3
+
+
+class TestUnwrapKeyExceptionHandling:
+    """Test that _unwrap_key only catches InvalidTag, not other exceptions."""
+
+    def test_unwrap_wrong_key_returns_none(self):
+        """Wrong wrapping key returns None (InvalidTag is caught)."""
+        salt = generate_salt()
+        right_key = _derive_key("alice:password", salt)
+        wrong_key = _derive_key("bob:password", salt)
+        cek = b"\x42" * KEY_LENGTH
+
+        iv, ct = _wrap_key(cek, right_key)
+        result = _unwrap_key(iv, ct, wrong_key)
+        assert result is None
+
+    def test_unwrap_invalid_iv_length_raises(self):
+        """Non-InvalidTag errors (e.g., bad IV length) should propagate."""
+        salt = generate_salt()
+        wrapping_key = _derive_key("alice:password", salt)
+        cek = b"\x42" * KEY_LENGTH
+
+        iv, ct = _wrap_key(cek, wrapping_key)
+        # Truncate IV to invalid length — this should raise ValueError,
+        # not be silently swallowed as None
+        with pytest.raises(Exception):
+            _unwrap_key(iv[:4], ct, wrapping_key)

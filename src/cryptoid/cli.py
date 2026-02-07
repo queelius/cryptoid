@@ -213,6 +213,20 @@ def resolve_users(
 
 
 # =============================================================================
+# Shortcode attribute helpers
+# =============================================================================
+
+
+def _escape_shortcode_attr(value: str) -> str:
+    """Escape a value for use in a Hugo shortcode attribute.
+
+    Strips double quotes to prevent attribute injection in shortcode
+    attributes like hint="...".
+    """
+    return value.replace('"', "")
+
+
+# =============================================================================
 # Shortcode extraction (flexible attribute parsing)
 # =============================================================================
 
@@ -286,7 +300,8 @@ def encrypt_file(
 
     # Build shortcode with config
     mode_attr = 'mode="user"'
-    hint_attr = f'hint="{config.password_hint or ""}"'
+    hint_value = _escape_shortcode_attr(config.password_hint or "")
+    hint_attr = f'hint="{hint_value}"'
     remember_attr = f'remember="{config.remember}"'
     hash_attr = f'hash="{hash_value}"'
     shortcode = f"{{{{< cryptoid-encrypted {mode_attr} {hint_attr} {remember_attr} {hash_attr} >}}}}\n{ciphertext}\n{{{{< /cryptoid-encrypted >}}}}"
@@ -377,6 +392,243 @@ def decrypt_file(
 def main():
     """Cryptoid: Client-side encrypted content for Hugo."""
     pass
+
+
+# =============================================================================
+# Config command group
+# =============================================================================
+
+
+@main.group()
+def config():
+    """Manage and inspect cryptoid configuration."""
+    pass
+
+
+@config.command("status")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_status(config_path: Path):
+    """Show the location of the config file."""
+    config_path = config_path.resolve()
+    if not config_path.exists():
+        click.echo(f"Config file not found: {config_path}", err=True)
+        sys.exit(1)
+    click.echo(f"Config file: {config_path}")
+
+
+@config.command("show")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_show(config_path: Path):
+    """Display the full configuration file in YAML format."""
+    config_path = config_path.resolve()
+    if not config_path.exists():
+        click.echo(f"Config file not found: {config_path}", err=True)
+        sys.exit(1)
+
+    try:
+        content = config_path.read_text(encoding="utf-8")
+        click.echo(content)
+    except Exception as e:
+        click.echo(f"Error reading config file: {e}", err=True)
+        sys.exit(1)
+
+
+@config.command("validate")
+@click.option(
+    "--content-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default="content",
+    help="Hugo content directory",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_validate(content_dir: Path, config_path: Path):
+    """Validate configuration and content consistency.
+
+    Checks that the config is well-formed, all group references in content
+    are valid, encrypted files are decryptable, and content hashes verify.
+    Reports errors and warnings separately.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # --- Check 1: Config loading ---
+    click.echo("Checking config...")
+    try:
+        config = load_config(config_path)
+        click.echo(f"  Config OK: {len(config['users'])} users, "
+                    f"{len(config['groups'])} groups")
+    except FileNotFoundError as e:
+        click.echo(f"  ERROR: {e}", err=True)
+        errors.append(str(e))
+        _print_validate_summary(errors, warnings)
+        sys.exit(1)
+    except CryptoidError as e:
+        click.echo(f"  ERROR: {e}", err=True)
+        errors.append(str(e))
+        _print_validate_summary(errors, warnings)
+        sys.exit(1)
+
+    # --- Check 2: Group references in front matter ---
+    click.echo("Checking group references...")
+    referenced_groups: set[str] = set()
+
+    for md_file in sorted(content_dir.rglob("*.md")):
+        rel = md_file.relative_to(content_dir)
+        content = md_file.read_text(encoding="utf-8")
+        fm, _ = parse_markdown(content)
+
+        file_groups = fm.get("groups")
+        if file_groups:
+            if isinstance(file_groups, str):
+                file_groups = [file_groups]
+            for group_name in file_groups:
+                referenced_groups.add(group_name)
+                if group_name != "all" and group_name not in config["groups"]:
+                    msg = f"File '{rel}' references undefined group '{group_name}'"
+                    click.echo(f"  ERROR: {msg}")
+                    errors.append(msg)
+
+    if not errors:
+        click.echo("  All group references OK")
+
+    # --- Check 3: Cascade resolution ---
+    click.echo("Checking cascade resolution...")
+    cascade_errors = 0
+
+    for md_file in sorted(content_dir.rglob("*.md")):
+        if md_file.name == "_index.md":
+            continue
+        rel = md_file.relative_to(content_dir)
+
+        enc_config = resolve_encryption(md_file, content_dir)
+        if enc_config is None:
+            continue
+
+        try:
+            users = resolve_users(enc_config.groups, config)
+            if not users:
+                msg = f"File '{rel}' resolves to empty user set"
+                click.echo(f"  ERROR: {msg}")
+                errors.append(msg)
+                cascade_errors += 1
+        except CryptoidError as e:
+            msg = f"File '{rel}': {e}"
+            click.echo(f"  ERROR: {msg}")
+            errors.append(msg)
+            cascade_errors += 1
+
+    if cascade_errors == 0:
+        click.echo("  Cascade resolution OK")
+
+    # --- Check 4: Encrypted file decryption verification ---
+    click.echo("Checking encrypted files...")
+    all_users = config["users"]
+    encrypted_file_count = 0
+    decrypt_errors = 0
+
+    for md_file in sorted(content_dir.rglob("*.md")):
+        content = md_file.read_text(encoding="utf-8")
+        if not is_already_encrypted(content):
+            continue
+
+        encrypted_file_count += 1
+        rel = md_file.relative_to(content_dir)
+        extracted = _extract_shortcode_content(content)
+
+        if not extracted:
+            msg = f"File '{rel}' has encrypted marker but no valid shortcode"
+            click.echo(f"  ERROR: {msg}")
+            errors.append(msg)
+            decrypt_errors += 1
+            continue
+
+        ciphertext = extracted["ciphertext"]
+        expected_hash = extracted["hash"]
+
+        # Try decrypting with any available credential
+        plaintext = None
+        for username, password in all_users.items():
+            try:
+                plaintext = decrypt(ciphertext, password, username)
+                break
+            except CryptoidError:
+                continue
+
+        if plaintext is None:
+            msg = (f"File '{rel}' cannot be decrypted with any "
+                   "configured credentials")
+            click.echo(f"  ERROR: {msg}")
+            errors.append(msg)
+            decrypt_errors += 1
+            continue
+
+        # --- Check 5: Content hash integrity ---
+        if expected_hash:
+            actual_hash = content_hash(plaintext)
+            if actual_hash != expected_hash:
+                msg = (f"File '{rel}' has content hash mismatch "
+                       f"(expected {expected_hash[:8]}..., "
+                       f"got {actual_hash[:8]}...)")
+                click.echo(f"  ERROR: {msg}")
+                errors.append(msg)
+                decrypt_errors += 1
+                continue
+
+        click.echo(f"  OK: {rel}")
+
+    if encrypted_file_count == 0:
+        click.echo("  No encrypted files found")
+    elif decrypt_errors == 0:
+        click.echo(f"  All {encrypted_file_count} encrypted files OK")
+
+    # --- Check 6: Unused groups ---
+    click.echo("Checking for unused groups...")
+    for group_name in config["groups"]:
+        if group_name == "admin":
+            continue  # admin is implicitly used everywhere
+        if group_name not in referenced_groups:
+            msg = f"Group '{group_name}' is defined but not referenced by any content"
+            click.echo(f"  WARNING: {msg}")
+            warnings.append(msg)
+
+    # --- Check 7: Users without group membership ---
+    click.echo("Checking user coverage...")
+    all_group_members: set[str] = set()
+    for members in config["groups"].values():
+        all_group_members.update(members)
+
+    for username in config["users"]:
+        if username not in all_group_members:
+            msg = f"User '{username}' is not a member of any group"
+            click.echo(f"  WARNING: {msg}")
+            warnings.append(msg)
+
+    if not warnings:
+        click.echo("  All users have group membership")
+
+    # --- Summary ---
+    _print_validate_summary(errors, warnings)
+
+    if errors:
+        sys.exit(1)
 
 
 @main.command()
@@ -755,7 +1007,8 @@ def rewrap(content_dir: Path, config_path: Path, rekey: bool):
 
         # Rebuild shortcode
         mode_attr = 'mode="user"'
-        hint_attr = f'hint="{extracted["hint"]}"'
+        hint_value = _escape_shortcode_attr(extracted["hint"])
+        hint_attr = f'hint="{hint_value}"'
         remember_attr = f'remember="{extracted["remember"]}"'
         hash_attr = f'hash="{extracted["hash"]}"'
         shortcode = f"{{{{< cryptoid-encrypted {mode_attr} {hint_attr} {remember_attr} {hash_attr} >}}}}\n{new_payload}\n{{{{< /cryptoid-encrypted >}}}}"
@@ -986,195 +1239,8 @@ def _unprotect_file(file_path: Path) -> None:
     click.echo("  encrypted: false (explicit opt-out)")
 
 
-# =============================================================================
-# Validate command
-# =============================================================================
-
-
-@main.command()
-@click.option(
-    "--content-dir",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default="content",
-    help="Hugo content directory",
-)
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(path_type=Path),
-    default=".cryptoid.yaml",
-    help="Path to config file",
-)
-def validate(content_dir: Path, config_path: Path):
-    """Validate configuration and content consistency.
-
-    Checks that the config is well-formed, all group references in content
-    are valid, encrypted files are decryptable, and content hashes verify.
-    Reports errors and warnings separately.
-    """
-    errors: list[str] = []
-    warnings: list[str] = []
-
-    # --- Check 1: Config loading ---
-    click.echo("Checking config...")
-    try:
-        config = load_config(config_path)
-        click.echo(f"  Config OK: {len(config['users'])} users, "
-                    f"{len(config['groups'])} groups")
-    except FileNotFoundError as e:
-        click.echo(f"  ERROR: {e}", err=True)
-        errors.append(str(e))
-        _print_validate_summary(errors, warnings)
-        sys.exit(1)
-    except CryptoidError as e:
-        click.echo(f"  ERROR: {e}", err=True)
-        errors.append(str(e))
-        _print_validate_summary(errors, warnings)
-        sys.exit(1)
-
-    # --- Check 2: Group references in front matter ---
-    click.echo("Checking group references...")
-    referenced_groups: set[str] = set()
-
-    for md_file in sorted(content_dir.rglob("*.md")):
-        rel = md_file.relative_to(content_dir)
-        content = md_file.read_text(encoding="utf-8")
-        fm, _ = parse_markdown(content)
-
-        file_groups = fm.get("groups")
-        if file_groups:
-            if isinstance(file_groups, str):
-                file_groups = [file_groups]
-            for group_name in file_groups:
-                referenced_groups.add(group_name)
-                if group_name != "all" and group_name not in config["groups"]:
-                    msg = f"File '{rel}' references undefined group '{group_name}'"
-                    click.echo(f"  ERROR: {msg}")
-                    errors.append(msg)
-
-    if not errors:
-        click.echo("  All group references OK")
-
-    # --- Check 3: Cascade resolution ---
-    click.echo("Checking cascade resolution...")
-    cascade_errors = 0
-
-    for md_file in sorted(content_dir.rglob("*.md")):
-        if md_file.name == "_index.md":
-            continue
-        rel = md_file.relative_to(content_dir)
-
-        enc_config = resolve_encryption(md_file, content_dir)
-        if enc_config is None:
-            continue
-
-        try:
-            users = resolve_users(enc_config.groups, config)
-            if not users:
-                msg = f"File '{rel}' resolves to empty user set"
-                click.echo(f"  ERROR: {msg}")
-                errors.append(msg)
-                cascade_errors += 1
-        except CryptoidError as e:
-            msg = f"File '{rel}': {e}"
-            click.echo(f"  ERROR: {msg}")
-            errors.append(msg)
-            cascade_errors += 1
-
-    if cascade_errors == 0:
-        click.echo("  Cascade resolution OK")
-
-    # --- Check 4: Encrypted file decryption verification ---
-    click.echo("Checking encrypted files...")
-    all_users = config["users"]
-    encrypted_file_count = 0
-    decrypt_errors = 0
-
-    for md_file in sorted(content_dir.rglob("*.md")):
-        content = md_file.read_text(encoding="utf-8")
-        if not is_already_encrypted(content):
-            continue
-
-        encrypted_file_count += 1
-        rel = md_file.relative_to(content_dir)
-        extracted = _extract_shortcode_content(content)
-
-        if not extracted:
-            msg = f"File '{rel}' has encrypted marker but no valid shortcode"
-            click.echo(f"  ERROR: {msg}")
-            errors.append(msg)
-            decrypt_errors += 1
-            continue
-
-        ciphertext = extracted["ciphertext"]
-        expected_hash = extracted["hash"]
-
-        # Try decrypting with any available credential
-        plaintext = None
-        for username, password in all_users.items():
-            try:
-                plaintext = decrypt(ciphertext, password, username)
-                break
-            except CryptoidError:
-                continue
-
-        if plaintext is None:
-            msg = (f"File '{rel}' cannot be decrypted with any "
-                   "configured credentials")
-            click.echo(f"  ERROR: {msg}")
-            errors.append(msg)
-            decrypt_errors += 1
-            continue
-
-        # --- Check 5: Content hash integrity ---
-        if expected_hash:
-            actual_hash = content_hash(plaintext)
-            if actual_hash != expected_hash:
-                msg = (f"File '{rel}' has content hash mismatch "
-                       f"(expected {expected_hash[:8]}..., "
-                       f"got {actual_hash[:8]}...)")
-                click.echo(f"  ERROR: {msg}")
-                errors.append(msg)
-                decrypt_errors += 1
-                continue
-
-        click.echo(f"  OK: {rel}")
-
-    if encrypted_file_count == 0:
-        click.echo("  No encrypted files found")
-    elif decrypt_errors == 0:
-        click.echo(f"  All {encrypted_file_count} encrypted files OK")
-
-    # --- Check 6: Unused groups ---
-    click.echo("Checking for unused groups...")
-    for group_name in config["groups"]:
-        if group_name == "admin":
-            continue  # admin is implicitly used everywhere
-        if group_name not in referenced_groups:
-            msg = f"Group '{group_name}' is defined but not referenced by any content"
-            click.echo(f"  WARNING: {msg}")
-            warnings.append(msg)
-
-    # --- Check 7: Users without group membership ---
-    click.echo("Checking user coverage...")
-    all_group_members: set[str] = set()
-    for members in config["groups"].values():
-        all_group_members.update(members)
-
-    for username in config["users"]:
-        if username not in all_group_members:
-            msg = f"User '{username}' is not a member of any group"
-            click.echo(f"  WARNING: {msg}")
-            warnings.append(msg)
-
-    if not warnings:
-        click.echo("  All users have group membership")
-
-    # --- Summary ---
-    _print_validate_summary(errors, warnings)
-
-    if errors:
-        sys.exit(1)
+# Backward compatibility: expose validate at top level as well
+main.add_command(config_validate, name="validate")
 
 
 def _print_validate_summary(errors: list[str], warnings: list[str]) -> None:
