@@ -151,15 +151,25 @@ cryptoid encrypt --content-dir content/ --dry-run
 cryptoid decrypt --content-dir content/ --config .cryptoid.yaml
 ```
 
+### Configuration Management
+
+```bash
+# Show config file location
+cryptoid config status
+
+# Display full config file
+cryptoid config show [--config PATH]
+
+# Validate config and content consistency
+cryptoid config validate --content-dir content/ [--config PATH]
+```
+
 ### Maintenance
 
 ```bash
 # Show encryption status of all files
 cryptoid status --content-dir content/ --config .cryptoid.yaml
 cryptoid status --verbose  # include group/user statistics
-
-# Validate config and content consistency
-cryptoid validate --content-dir content/ --config .cryptoid.yaml
 
 # Re-wrap keys after changing users/groups (no decrypt needed)
 cryptoid rewrap --content-dir content/ --config .cryptoid.yaml

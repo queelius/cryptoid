@@ -25,11 +25,13 @@ pytest tests/ -k "test_encrypt_decrypt_roundtrip" -v
 pytest tests/ --cov=cryptoid --cov-report=term-missing
 
 # CLI usage
+cryptoid config status                                               # show config location
+cryptoid config show [--config PATH]                                 # display full config
+cryptoid config validate [--content-dir ...] [--verbose]             # validate config + content
 cryptoid encrypt --content-dir content/ --config .cryptoid.yaml [--dry-run]
 cryptoid decrypt --content-dir content/ --config .cryptoid.yaml
 cryptoid status  --content-dir content/ --config .cryptoid.yaml [--verbose]
 cryptoid rewrap  --content-dir content/ --config .cryptoid.yaml [--rekey]
-cryptoid validate --content-dir content/ --config .cryptoid.yaml
 cryptoid protect  content/private/ --groups team [--hint "..."] [--remember ask]
 cryptoid unprotect content/private/
 cryptoid hugo status|install|uninstall
