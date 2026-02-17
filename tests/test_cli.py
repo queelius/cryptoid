@@ -1,7 +1,10 @@
 """Tests for cryptoid.cli module (v2 multi-user)."""
 
 import pytest
+from unittest.mock import patch, MagicMock
 from click.testing import CliRunner
+
+import frontmatter as fm
 
 from cryptoid.cli import (
     main,
@@ -1675,3 +1678,150 @@ class TestBuildContentTree:
         assert "empty/" not in labels
         assert "bare/" not in labels
         assert "page.md" in labels
+
+
+class TestInteractiveProtect:
+    """Test interactive protect mode (-i flag)."""
+
+    def _make_site(self, tmp_path):
+        """Create a content dir with a mix of protected and unprotected files."""
+        content = tmp_path / "content"
+        content.mkdir()
+        (content / "public.md").write_text("---\ntitle: Public\n---\nPublic content")
+        priv = content / "private"
+        priv.mkdir()
+        (priv / "_index.md").write_text(
+            "---\ntitle: Private\nencrypted: true\ngroups:\n  - team\n---\n"
+        )
+        (priv / "secret.md").write_text("---\ntitle: Secret\n---\nSecret stuff")
+        config_path = tmp_path / ".cryptoid.yaml"
+        config_path.write_text(
+            "users:\n  alice: password1\n  bob: password2\n"
+            "groups:\n  admin:\n    - alice\n  team:\n    - alice\n    - bob\n"
+            "salt: aa11bb22cc33dd44ee55ff6677889900\n"
+            f"content_dir: {content}\n"
+        )
+        return content, config_path
+
+    def test_interactive_flag_exists(self, runner, tmp_path):
+        """The -i flag is accepted and calls _interactive_protect."""
+        _, config_path = self._make_site(tmp_path)
+        with patch("cryptoid.cli._interactive_protect") as mock_ip:
+            result = runner.invoke(
+                main, ["protect", "-i", "--config", str(config_path)]
+            )
+            assert result.exit_code == 0
+            mock_ip.assert_called_once()
+
+    def test_path_required_without_interactive(self, runner):
+        """Without -i and no PATH, the command exits with an error."""
+        result = runner.invoke(main, ["protect"])
+        assert result.exit_code != 0
+        assert "PATH is required" in result.output or "Error" in result.output
+
+    def test_interactive_applies_protect(self, runner, tmp_path):
+        """Selecting an unprotected file marks it encrypted: true."""
+        content, config_path = self._make_site(tmp_path)
+
+        # Tree order: public.md (0, not encrypted), private/ (1, encrypted),
+        #             secret.md (2, encrypted via cascade)
+        # Selecting all three means public.md (index 0) gets newly protected
+        with patch("cryptoid.cli.TerminalMenu") as MockMenu:
+            instance = MagicMock()
+            instance.show.return_value = (0, 1, 2)
+            MockMenu.return_value = instance
+            result = runner.invoke(
+                main,
+                ["protect", "-i", "--config", str(config_path)],
+                input="y\n",
+            )
+
+        assert result.exit_code == 0
+        post = fm.load(str(content / "public.md"))
+        assert post.metadata.get("encrypted") is True
+
+    def test_interactive_applies_unprotect(self, runner, tmp_path):
+        """Deselecting a protected directory unprotects it."""
+        content, config_path = self._make_site(tmp_path)
+
+        # Tree order: public.md (0, not encrypted), private/ (1, encrypted),
+        #             secret.md (2, encrypted via cascade)
+        # Selecting only public.md means private/ and secret.md get unprotected
+        with patch("cryptoid.cli.TerminalMenu") as MockMenu:
+            instance = MagicMock()
+            instance.show.return_value = (0,)
+            MockMenu.return_value = instance
+            result = runner.invoke(
+                main,
+                ["protect", "-i", "--config", str(config_path)],
+                input="y\n",
+            )
+
+        assert result.exit_code == 0
+        # _unprotect_directory removes _index.md when it has no remaining content
+        # beyond title, so the file may be deleted or have encrypted removed
+        index_path = content / "private" / "_index.md"
+        if index_path.exists():
+            index_post = fm.load(str(index_path))
+            assert "encrypted" not in index_post.metadata or index_post.metadata.get("encrypted") is not True
+        # If _index.md was deleted, that also means unprotected
+
+    def test_interactive_no_changes(self, runner, tmp_path):
+        """When selection matches current state, prints 'No changes'."""
+        content, config_path = self._make_site(tmp_path)
+
+        # Tree order: public.md (0, not encrypted), private/ (1, encrypted),
+        #             secret.md (2, encrypted via cascade)
+        # Selecting (1, 2) matches preselected — no change
+        with patch("cryptoid.cli.TerminalMenu") as MockMenu:
+            instance = MagicMock()
+            instance.show.return_value = (1, 2)
+            MockMenu.return_value = instance
+            result = runner.invoke(
+                main,
+                ["protect", "-i", "--config", str(config_path)],
+            )
+
+        assert result.exit_code == 0
+        assert "No changes" in result.output
+
+    def test_interactive_quit(self, runner, tmp_path):
+        """When menu returns None (cancelled), prints 'Cancelled'."""
+        content, config_path = self._make_site(tmp_path)
+
+        with patch("cryptoid.cli.TerminalMenu") as MockMenu:
+            instance = MagicMock()
+            instance.show.return_value = None
+            MockMenu.return_value = instance
+            result = runner.invoke(
+                main,
+                ["protect", "-i", "--config", str(config_path)],
+            )
+
+        assert result.exit_code == 0
+        assert "Cancelled" in result.output
+
+    def test_interactive_with_groups(self, runner, tmp_path):
+        """--groups admin applies to newly protected items."""
+        content, config_path = self._make_site(tmp_path)
+
+        # Tree order: public.md (0), private/ (1), secret.md (2)
+        # Selecting all three with --groups admin — public.md gets newly protected
+        with patch("cryptoid.cli.TerminalMenu") as MockMenu:
+            instance = MagicMock()
+            instance.show.return_value = (0, 1, 2)
+            MockMenu.return_value = instance
+            result = runner.invoke(
+                main,
+                [
+                    "protect", "-i",
+                    "--config", str(config_path),
+                    "--groups", "admin",
+                ],
+                input="y\n",
+            )
+
+        assert result.exit_code == 0
+        post = fm.load(str(content / "public.md"))
+        assert post.metadata.get("encrypted") is True
+        assert "admin" in post.metadata.get("groups", [])

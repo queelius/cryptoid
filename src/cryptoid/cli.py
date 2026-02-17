@@ -12,6 +12,7 @@ from typing import Any
 import click
 import yaml
 import frontmatter
+from simple_term_menu import TerminalMenu
 
 from .crypto import (
     encrypt,
@@ -2416,8 +2417,91 @@ def rewrap(content_dir: Path | None, config_path: Path, rekey: bool):
 # =============================================================================
 
 
+def _interactive_protect(
+    config: dict[str, Any],
+    groups: tuple[str, ...],
+    hint: str | None,
+    remember: str | None,
+) -> None:
+    """Browse content tree and interactively select items to protect/unprotect."""
+    content_dir = _resolve_content_dir(None, config)
+    entries = _build_content_tree(content_dir)
+
+    if not entries:
+        click.echo("No content files found.")
+        return
+
+    menu_labels = [e["label"] for e in entries]
+    preselected = [i for i, e in enumerate(entries) if e["encrypted"]]
+
+    menu = TerminalMenu(
+        menu_labels,
+        multi_select=True,
+        show_multi_select_hint=True,
+        preselected_entries=preselected,
+        title="  Select content to protect/unprotect\n",
+        multi_select_cursor="[x] ",
+        multi_select_select_on_accept=False,
+        multi_select_empty_ok=True,
+    )
+
+    selected = menu.show()
+
+    if selected is None:
+        click.echo("Cancelled.")
+        return
+
+    selected_set = set(selected)
+    preselected_set = set(preselected)
+
+    to_protect = selected_set - preselected_set
+    to_unprotect = preselected_set - selected_set
+
+    if not to_protect and not to_unprotect:
+        click.echo("No changes.")
+        return
+
+    # Print summary
+    for idx in sorted(to_protect):
+        click.echo(f"  + protect: {entries[idx]['label'].strip()}")
+    for idx in sorted(to_unprotect):
+        click.echo(f"  - unprotect: {entries[idx]['label'].strip()}")
+
+    total = len(to_protect) + len(to_unprotect)
+    if not click.confirm(f"Apply {total} changes?"):
+        click.echo("Cancelled.")
+        return
+
+    # Apply protections
+    for idx in sorted(to_protect):
+        entry = entries[idx]
+        if entry["type"] == "dir":
+            _protect_directory(entry["path"], groups, hint, remember)
+        else:
+            _protect_file(entry["path"], groups, hint, remember)
+
+    # Apply unprotections
+    for idx in sorted(to_unprotect):
+        entry = entries[idx]
+        if entry["type"] == "dir":
+            _unprotect_directory(entry["path"])
+        else:
+            _unprotect_file(entry["path"])
+
+
 @main.command()
-@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.argument("path", type=click.Path(exists=True, path_type=Path), required=False, default=None)
+@click.option(
+    "-i", "--interactive",
+    is_flag=True,
+    help="Browse content tree to select items",
+)
+@click.option(
+    "--config", "config_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Path to .cryptoid.yaml config file",
+)
 @click.option(
     "--groups",
     multiple=True,
@@ -2434,11 +2518,21 @@ def rewrap(content_dir: Path | None, config_path: Path, rekey: bool):
     default=None,
     help="Browser credential storage mode",
 )
-def protect(path: Path, groups: tuple[str, ...], hint: str | None, remember: str | None):
+def protect(
+    path: Path | None,
+    interactive: bool,
+    config_path: Path | None,
+    groups: tuple[str, ...],
+    hint: str | None,
+    remember: str | None,
+):
     """Mark a file or directory for encryption.
 
     If PATH is a directory, creates or updates its _index.md with
     encryption settings. If PATH is a file, updates its front matter.
+
+    Use -i/--interactive to browse the content tree and select items
+    to protect or unprotect.
 
     This does not encrypt content — it configures what will be encrypted
     when you run 'cryptoid encrypt'.
@@ -2448,7 +2542,18 @@ def protect(path: Path, groups: tuple[str, ...], hint: str | None, remember: str
         cryptoid protect content/private/ --groups team
 
         cryptoid protect content/secret.md --groups admin --hint "Ask the lead"
+
+        cryptoid protect -i --config .cryptoid.yaml
     """
+    if interactive:
+        config = load_config(config_path)
+        _interactive_protect(config, groups, hint, remember)
+        return
+
+    if path is None:
+        click.echo("Error: PATH is required (or use --interactive / -i)")
+        sys.exit(1)
+
     path = path.resolve()
 
     if path.is_dir():
