@@ -13,34 +13,26 @@ def runner():
     return CliRunner()
 
 
-@pytest.fixture
-def isolated_fs(runner):
-    """Run tests in isolated filesystem."""
-    with runner.isolated_filesystem():
-        yield Path.cwd()
-
-
 class TestClaudeStatus:
     """Test claude status command."""
 
-    def test_status_not_installed(self, runner, isolated_fs, monkeypatch):
+    def test_status_not_installed(self, runner, tmp_path, monkeypatch):
         """Status shows not installed when skill is missing."""
-        # Use isolated filesystem as home
-        monkeypatch.setenv("HOME", str(isolated_fs))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
 
         result = runner.invoke(main, ["claude", "status"])
 
         assert result.exit_code == 0
         assert "not installed" in result.output.lower() or "missing" in result.output.lower()
 
-    def test_status_local_installed(self, runner, isolated_fs, monkeypatch):
+    def test_status_local_installed(self, runner, tmp_path, monkeypatch):
         """Status shows installed when local skill exists."""
-        monkeypatch.setenv("HOME", str(isolated_fs / "home"))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.chdir(tmp_path)
 
         # Create local skill
-        skill_path = isolated_fs / ".claude" / "skills" / "cryptoid"
+        skill_path = tmp_path / ".claude" / "skills" / "cryptoid"
         skill_path.mkdir(parents=True)
         (skill_path / "SKILL.md").write_text("# cryptoid skill")
 
@@ -49,12 +41,12 @@ class TestClaudeStatus:
         assert result.exit_code == 0
         assert "[installed] local" in result.output
 
-    def test_status_global_installed(self, runner, isolated_fs, monkeypatch):
+    def test_status_global_installed(self, runner, tmp_path, monkeypatch):
         """Status shows installed when global skill exists."""
-        home = isolated_fs / "home"
+        home = tmp_path / "home"
         home.mkdir()
         monkeypatch.setenv("HOME", str(home))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.chdir(tmp_path)
 
         # Create global skill
         skill_path = home / ".claude" / "skills" / "cryptoid"
@@ -66,15 +58,15 @@ class TestClaudeStatus:
         assert result.exit_code == 0
         assert "[installed] global" in result.output
 
-    def test_status_both_installed(self, runner, isolated_fs, monkeypatch):
+    def test_status_both_installed(self, runner, tmp_path, monkeypatch):
         """Status shows both when local and global skills exist."""
-        home = isolated_fs / "home"
+        home = tmp_path / "home"
         home.mkdir()
         monkeypatch.setenv("HOME", str(home))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.chdir(tmp_path)
 
         # Create local skill
-        local_path = isolated_fs / ".claude" / "skills" / "cryptoid"
+        local_path = tmp_path / ".claude" / "skills" / "cryptoid"
         local_path.mkdir(parents=True)
         (local_path / "SKILL.md").write_text("# local cryptoid skill")
 
@@ -94,33 +86,33 @@ class TestClaudeStatus:
 class TestClaudeInstall:
     """Test claude install command."""
 
-    def test_install_local_default(self, runner, isolated_fs, monkeypatch):
+    def test_install_local_default(self, runner, tmp_path, monkeypatch):
         """Install creates local skill by default."""
-        monkeypatch.setenv("HOME", str(isolated_fs / "home"))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.chdir(tmp_path)
 
         result = runner.invoke(main, ["claude", "install"])
 
         assert result.exit_code == 0
-        assert (isolated_fs / ".claude" / "skills" / "cryptoid" / "SKILL.md").exists()
+        assert (tmp_path / ".claude" / "skills" / "cryptoid" / "SKILL.md").exists()
         assert "local" in result.output
 
-    def test_install_local_explicit(self, runner, isolated_fs, monkeypatch):
+    def test_install_local_explicit(self, runner, tmp_path, monkeypatch):
         """Install --local creates local skill."""
-        monkeypatch.setenv("HOME", str(isolated_fs / "home"))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.chdir(tmp_path)
 
         result = runner.invoke(main, ["claude", "install", "--local"])
 
         assert result.exit_code == 0
-        assert (isolated_fs / ".claude" / "skills" / "cryptoid" / "SKILL.md").exists()
+        assert (tmp_path / ".claude" / "skills" / "cryptoid" / "SKILL.md").exists()
 
-    def test_install_global(self, runner, isolated_fs, monkeypatch):
+    def test_install_global(self, runner, tmp_path, monkeypatch):
         """Install --global creates global skill."""
-        home = isolated_fs / "home"
+        home = tmp_path / "home"
         home.mkdir()
         monkeypatch.setenv("HOME", str(home))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.chdir(tmp_path)
 
         result = runner.invoke(main, ["claude", "install", "--global"])
 
@@ -128,26 +120,26 @@ class TestClaudeInstall:
         assert (home / ".claude" / "skills" / "cryptoid" / "SKILL.md").exists()
         assert "global" in result.output
 
-    def test_install_creates_directories(self, runner, isolated_fs, monkeypatch):
+    def test_install_creates_directories(self, runner, tmp_path, monkeypatch):
         """Install creates parent directories if missing."""
-        monkeypatch.setenv("HOME", str(isolated_fs / "home"))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.chdir(tmp_path)
 
         # No .claude directory exists
-        assert not (isolated_fs / ".claude").exists()
+        assert not (tmp_path / ".claude").exists()
 
         result = runner.invoke(main, ["claude", "install"])
 
         assert result.exit_code == 0
-        assert (isolated_fs / ".claude" / "skills" / "cryptoid").is_dir()
+        assert (tmp_path / ".claude" / "skills" / "cryptoid").is_dir()
 
-    def test_install_overwrites_existing(self, runner, isolated_fs, monkeypatch):
+    def test_install_overwrites_existing(self, runner, tmp_path, monkeypatch):
         """Install overwrites existing skill file."""
-        monkeypatch.setenv("HOME", str(isolated_fs / "home"))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.chdir(tmp_path)
 
         # Create existing skill
-        skill_path = isolated_fs / ".claude" / "skills" / "cryptoid"
+        skill_path = tmp_path / ".claude" / "skills" / "cryptoid"
         skill_path.mkdir(parents=True)
         old_content = "# old skill content"
         (skill_path / "SKILL.md").write_text(old_content)
@@ -159,15 +151,15 @@ class TestClaudeInstall:
         assert new_content != old_content
         assert "cryptoid" in new_content
 
-    def test_install_copies_actual_content(self, runner, isolated_fs, monkeypatch):
+    def test_install_copies_actual_content(self, runner, tmp_path, monkeypatch):
         """Install copies actual skill content from bundled file."""
-        monkeypatch.setenv("HOME", str(isolated_fs / "home"))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.chdir(tmp_path)
 
         result = runner.invoke(main, ["claude", "install"])
 
         assert result.exit_code == 0
-        content = (isolated_fs / ".claude" / "skills" / "cryptoid" / "SKILL.md").read_text()
+        content = (tmp_path / ".claude" / "skills" / "cryptoid" / "SKILL.md").read_text()
         # Check for expected skill content markers
         assert "name: cryptoid" in content
         assert "description:" in content
@@ -177,13 +169,13 @@ class TestClaudeInstall:
 class TestClaudeUninstall:
     """Test claude uninstall command."""
 
-    def test_uninstall_local(self, runner, isolated_fs, monkeypatch):
+    def test_uninstall_local(self, runner, tmp_path, monkeypatch):
         """Uninstall --local removes local skill."""
-        monkeypatch.setenv("HOME", str(isolated_fs / "home"))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.chdir(tmp_path)
 
         # Create local skill
-        skill_path = isolated_fs / ".claude" / "skills" / "cryptoid"
+        skill_path = tmp_path / ".claude" / "skills" / "cryptoid"
         skill_path.mkdir(parents=True)
         (skill_path / "SKILL.md").write_text("# cryptoid skill")
 
@@ -193,12 +185,12 @@ class TestClaudeUninstall:
         assert not (skill_path / "SKILL.md").exists()
         assert "local" in result.output
 
-    def test_uninstall_global(self, runner, isolated_fs, monkeypatch):
+    def test_uninstall_global(self, runner, tmp_path, monkeypatch):
         """Uninstall --global removes global skill."""
-        home = isolated_fs / "home"
+        home = tmp_path / "home"
         home.mkdir()
         monkeypatch.setenv("HOME", str(home))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.chdir(tmp_path)
 
         # Create global skill
         skill_path = home / ".claude" / "skills" / "cryptoid"
@@ -211,13 +203,13 @@ class TestClaudeUninstall:
         assert not (skill_path / "SKILL.md").exists()
         assert "global" in result.output
 
-    def test_uninstall_removes_empty_dirs(self, runner, isolated_fs, monkeypatch):
+    def test_uninstall_removes_empty_dirs(self, runner, tmp_path, monkeypatch):
         """Uninstall removes empty parent directories."""
-        monkeypatch.setenv("HOME", str(isolated_fs / "home"))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.chdir(tmp_path)
 
         # Create local skill (only thing in .claude/)
-        skill_path = isolated_fs / ".claude" / "skills" / "cryptoid"
+        skill_path = tmp_path / ".claude" / "skills" / "cryptoid"
         skill_path.mkdir(parents=True)
         (skill_path / "SKILL.md").write_text("# cryptoid skill")
 
@@ -225,22 +217,22 @@ class TestClaudeUninstall:
 
         assert result.exit_code == 0
         # cryptoid/ and skills/ should be removed
-        assert not (isolated_fs / ".claude" / "skills" / "cryptoid").exists()
-        assert not (isolated_fs / ".claude" / "skills").exists()
+        assert not (tmp_path / ".claude" / "skills" / "cryptoid").exists()
+        assert not (tmp_path / ".claude" / "skills").exists()
         # .claude/ is preserved (may contain other files in real usage)
 
-    def test_uninstall_preserves_other_files(self, runner, isolated_fs, monkeypatch):
+    def test_uninstall_preserves_other_files(self, runner, tmp_path, monkeypatch):
         """Uninstall preserves other skills/files."""
-        monkeypatch.setenv("HOME", str(isolated_fs / "home"))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.chdir(tmp_path)
 
         # Create cryptoid skill
-        skill_path = isolated_fs / ".claude" / "skills" / "cryptoid"
+        skill_path = tmp_path / ".claude" / "skills" / "cryptoid"
         skill_path.mkdir(parents=True)
         (skill_path / "SKILL.md").write_text("# cryptoid skill")
 
         # Create another skill
-        other_skill = isolated_fs / ".claude" / "skills" / "other-tool"
+        other_skill = tmp_path / ".claude" / "skills" / "other-tool"
         other_skill.mkdir(parents=True)
         (other_skill / "SKILL.md").write_text("# other skill")
 
@@ -250,25 +242,25 @@ class TestClaudeUninstall:
         assert not (skill_path / "SKILL.md").exists()
         assert (other_skill / "SKILL.md").exists()
 
-    def test_uninstall_not_installed(self, runner, isolated_fs, monkeypatch):
+    def test_uninstall_not_installed(self, runner, tmp_path, monkeypatch):
         """Uninstall succeeds even if not installed."""
-        monkeypatch.setenv("HOME", str(isolated_fs / "home"))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.chdir(tmp_path)
 
         result = runner.invoke(main, ["claude", "uninstall"])
 
         assert result.exit_code == 0
         assert "not installed" in result.output.lower()
 
-    def test_uninstall_default_is_local(self, runner, isolated_fs, monkeypatch):
+    def test_uninstall_default_is_local(self, runner, tmp_path, monkeypatch):
         """Uninstall defaults to local (same as install)."""
-        home = isolated_fs / "home"
+        home = tmp_path / "home"
         home.mkdir()
         monkeypatch.setenv("HOME", str(home))
-        monkeypatch.chdir(isolated_fs)
+        monkeypatch.chdir(tmp_path)
 
         # Create both local and global skills
-        local_path = isolated_fs / ".claude" / "skills" / "cryptoid"
+        local_path = tmp_path / ".claude" / "skills" / "cryptoid"
         local_path.mkdir(parents=True)
         (local_path / "SKILL.md").write_text("# local")
 

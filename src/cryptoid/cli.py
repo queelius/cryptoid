@@ -18,6 +18,8 @@ from .crypto import (
     decrypt,
     content_hash,
     rewrap_keys,
+    generate_salt,
+    salt_to_hex,
     hex_to_salt,
     validate_username,
     CryptoidError,
@@ -36,73 +38,277 @@ from .frontmatter import (
 # =============================================================================
 
 
-def load_config(config_path: Path) -> dict[str, Any]:
-    """Load cryptoid configuration from YAML file.
+def _get_global_config_path() -> Path:
+    """Return the global config file path.
 
-    Expected format:
-        users:
-          alice: "alice-password"
-          bob: "bob-password"
-        groups:
-          admin: [alice]
-          team: [alice, bob]
-        salt: "hex-string-32-chars"
-
-    Args:
-        config_path: Path to .cryptoid.yaml
-
-    Returns:
-        Validated configuration dictionary with 'users', 'groups', 'salt'.
-
-    Raises:
-        FileNotFoundError: If config file doesn't exist.
-        CryptoidError: If config is invalid.
+    Uses $XDG_CONFIG_HOME/cryptoid/config.yaml if XDG_CONFIG_HOME is set,
+    otherwise ~/.config/cryptoid/config.yaml.
     """
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+    import os
 
-    with open(config_path) as f:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        base = Path(xdg)
+    else:
+        base = Path.home() / ".config"
+    return base / "cryptoid" / "config.yaml"
+
+
+def _load_global_config() -> dict[str, Any]:
+    """Load global config if it exists, otherwise return empty dict.
+
+    The global config may contain:
+        - users: personal credentials merged into every project
+        - content_dir: default Hugo content directory
+
+    Global config never contains groups or salt (those are project-specific).
+    """
+    path = _get_global_config_path()
+    if not path.exists():
+        return {}
+
+    with open(path) as f:
         config = yaml.safe_load(f) or {}
 
-    # Validate users
+    # Validate global users if present
     users = config.get("users")
-    if not users or not isinstance(users, dict):
+    if users and isinstance(users, dict):
+        for username, password in users.items():
+            validate_username(str(username))
+            if not password:
+                raise CryptoidError(
+                    f"Global config: password for user '{username}' cannot be empty"
+                )
+        config["users"] = {str(k): str(v) for k, v in users.items()}
+
+    return config
+
+
+def load_config(config_path: Path) -> dict[str, Any]:
+    """Load cryptoid configuration, merging global and local configs.
+
+    Merge semantics:
+        - users: union, local wins on password conflict (with warning)
+        - groups: union of members for same-named groups (additive)
+        - salt: local overrides global
+        - content_dir: local overrides global
+        - admin: local overrides global
+
+    If no local config exists but a global config does, returns global-only
+    config (users + content_dir + groups, no salt).
+
+    Args:
+        config_path: Path to local .cryptoid.yaml
+
+    Returns:
+        Validated configuration dictionary.
+
+    Raises:
+        FileNotFoundError: If neither local nor global config exists.
+        CryptoidError: If merged config is invalid.
+    """
+    global_config = _load_global_config()
+
+    if config_path.exists():
+        with open(config_path) as f:
+            config = yaml.safe_load(f) or {}
+    elif global_config:
+        config = {}
+    else:
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    # Merge users (global first, local overrides on conflict)
+    global_users = global_config.get("users", {})
+    local_users = config.get("users", {})
+
+    # Warn about password conflicts
+    for username in global_users:
+        if username in local_users and str(global_users[username]) != str(local_users[username]):
+            click.echo(
+                f"Note: user '{username}' has different passwords in "
+                f"global and local config (using local)",
+                err=True,
+            )
+
+    merged_users = {**global_users, **local_users}
+
+    if not merged_users:
         raise CryptoidError("Config must have a non-empty 'users' dict")
 
-    for username, password in users.items():
+    # Validate merged users
+    for username, password in merged_users.items():
         validate_username(str(username))
         if not password:
             raise CryptoidError(f"Password for user '{username}' cannot be empty")
-        # Ensure string types
-        users[username] = str(password)
 
-    config["users"] = {str(k): str(v) for k, v in users.items()}
+    config["users"] = {str(k): str(v) for k, v in merged_users.items()}
 
-    # Validate groups
-    groups = config.get("groups", {})
-    if not isinstance(groups, dict):
-        raise CryptoidError("'groups' must be a dict")
+    # Merge groups (additive union of members for same-named groups)
+    global_groups = global_config.get("groups", {})
+    local_groups = config.get("groups", {})
+    merged_groups: dict[str, list[str]] = {}
 
-    for group_name, members in groups.items():
-        if not isinstance(members, list):
+    all_group_names = set(global_groups.keys()) | set(local_groups.keys())
+    for group_name in all_group_names:
+        global_members = global_groups.get(group_name, [])
+        local_members = local_groups.get(group_name, [])
+        if not isinstance(global_members, list):
+            raise CryptoidError(f"Global group '{group_name}' members must be a list")
+        if not isinstance(local_members, list):
             raise CryptoidError(f"Group '{group_name}' members must be a list")
+        # Union of members, preserving order (local first, then global additions)
+        seen = set()
+        combined = []
+        for member in list(local_members) + list(global_members):
+            m = str(member)
+            if m not in seen:
+                seen.add(m)
+                combined.append(m)
+        merged_groups[group_name] = combined
+
+    # Validate group members exist in merged users
+    for group_name, members in merged_groups.items():
         for member in members:
-            if str(member) not in config["users"]:
+            if member not in config["users"]:
                 raise CryptoidError(
                     f"Group '{group_name}' member '{member}' not found in users"
                 )
-        groups[group_name] = [str(m) for m in members]
 
-    config["groups"] = groups
+    config["groups"] = merged_groups
 
-    # Validate salt
+    # Validate salt (local only)
     salt_hex = config.get("salt")
+    if not salt_hex and "salt" in global_config:
+        salt_hex = global_config["salt"]
+        config["salt"] = salt_hex
     if salt_hex:
         config["salt_bytes"] = hex_to_salt(str(salt_hex))
     else:
         config["salt_bytes"] = None
 
+    # Resolve content_dir: local > global
+    if "content_dir" not in config and "content_dir" in global_config:
+        config["content_dir"] = global_config["content_dir"]
+
+    # Resolve admin: local > global
+    if "admin" not in config and "admin" in global_config:
+        config["admin"] = global_config["admin"]
+
+    # Validate admin exists in merged users
+    admin = config.get("admin")
+    if admin and str(admin) not in config["users"]:
+        raise CryptoidError(
+            f"admin '{admin}' not found in users"
+        )
+    if admin:
+        config["admin"] = str(admin)
+
     return config
+
+
+def save_config(config_path: Path, config_data: dict[str, Any]) -> None:
+    """Write cryptoid configuration to YAML file.
+
+    Writes user-facing keys, excluding internal derived fields like salt_bytes.
+
+    Args:
+        config_path: Path to .cryptoid.yaml
+        config_data: Configuration dictionary to write.
+    """
+    # Ordered list of keys to persist (skip internal fields like salt_bytes)
+    persist_keys = ["users", "groups", "salt", "content_dir", "admin"]
+    output = {k: config_data[k] for k in persist_keys if k in config_data}
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.dump(output, f, default_flow_style=False, sort_keys=False)
+
+
+def _load_raw_config(config_path: Path) -> dict[str, Any]:
+    """Load raw YAML config without validation.
+
+    Used by mutating commands that need to modify and re-save the config
+    without the side effects of full validation (like salt_bytes injection).
+
+    Args:
+        config_path: Path to .cryptoid.yaml
+
+    Returns:
+        Raw configuration dictionary.
+
+    Raises:
+        FileNotFoundError: If config file doesn't exist.
+    """
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    with open(config_path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _merged_users(raw: dict[str, Any]) -> dict[str, str]:
+    """Return merged users from global config + the given raw config.
+
+    Used by mutation commands that need to validate user existence against
+    the effective user set (global + local), not just the tier being modified.
+    """
+    global_users = _load_global_config().get("users", {})
+    local_users = raw.get("users", {})
+    return {**global_users, **local_users}
+
+
+# =============================================================================
+# Content directory resolution
+# =============================================================================
+
+
+def _resolve_content_dir(
+    cli_value: Path | None,
+    config: dict[str, Any] | None = None,
+) -> Path:
+    """Resolve content directory from CLI > env > config.
+
+    Args:
+        cli_value: Value from --content-dir flag (None if not specified).
+        config: Loaded config dict (may contain 'content_dir' from local or global).
+
+    Returns:
+        Resolved Path to content directory.
+    """
+    import os
+
+    source: str
+    result: str
+
+    # Priority: CLI > env > config (no default)
+    if cli_value is not None:
+        return cli_value  # Click already validated existence if exists=True
+    elif os.environ.get("CRYPTOID_CONTENT_DIR"):
+        result = os.environ["CRYPTOID_CONTENT_DIR"]
+        source = "CRYPTOID_CONTENT_DIR environment variable"
+    elif config and "content_dir" in config:
+        result = config["content_dir"]
+        source = "config file"
+    else:
+        click.echo(
+            "Error: no content directory specified. Use --content-dir, "
+            "set CRYPTOID_CONTENT_DIR, or add content_dir to your config.",
+            err=True,
+        )
+        sys.exit(1)
+
+    resolved = Path(result).expanduser()
+    if not resolved.is_absolute():
+        resolved = Path.cwd() / resolved
+
+    if not resolved.is_dir():
+        click.echo(
+            f"Error: content directory '{result}' does not exist "
+            f"(from {source})",
+            err=True,
+        )
+        sys.exit(1)
+
+    return resolved
 
 
 # =============================================================================
@@ -191,7 +397,7 @@ def resolve_users(
         CryptoidError: If a referenced group doesn't exist.
     """
     all_users = config["users"]
-    groups = config["groups"]
+    groups = config.get("groups", {})
 
     # None or contains "all" → every user
     if groups_list is None or "all" in groups_list:
@@ -209,6 +415,11 @@ def resolve_users(
         for member in groups["admin"]:
             resolved[member] = all_users[member]
 
+    # Always inject admin user if configured
+    admin_user = config.get("admin")
+    if admin_user and admin_user in all_users:
+        resolved[admin_user] = all_users[admin_user]
+
     return resolved
 
 
@@ -224,6 +435,30 @@ def _escape_shortcode_attr(value: str) -> str:
     attributes like hint="...".
     """
     return value.replace('"', "")
+
+
+def _build_shortcode(hint: str, remember: str, hash_value: str, ciphertext: str) -> str:
+    """Build a cryptoid-encrypted Hugo shortcode.
+
+    Args:
+        hint: Password hint (will be escaped for shortcode safety).
+        remember: Remember mode (none/session/local/ask).
+        hash_value: Content hash for integrity verification.
+        ciphertext: Base64-encoded encrypted payload.
+
+    Returns:
+        Complete Hugo shortcode string.
+    """
+    mode_attr = 'mode="user"'
+    hint_value = _escape_shortcode_attr(hint)
+    hint_attr = f'hint="{hint_value}"'
+    remember_attr = f'remember="{remember}"'
+    hash_attr = f'hash="{hash_value}"'
+    return (
+        f"{{{{< cryptoid-encrypted {mode_attr} {hint_attr} {remember_attr} {hash_attr} >}}}}\n"
+        f"{ciphertext}\n"
+        f"{{{{< /cryptoid-encrypted >}}}}"
+    )
 
 
 # =============================================================================
@@ -264,6 +499,24 @@ def _extract_shortcode_content(content: str) -> dict[str, str] | None:
 # =============================================================================
 
 
+def _try_decrypt_any_user(ciphertext: str, users: dict[str, str]) -> str | None:
+    """Try decrypting ciphertext with each user credential.
+
+    Args:
+        ciphertext: Base64-encoded v2 payload.
+        users: Dict of {username: password} to try.
+
+    Returns:
+        Decrypted plaintext if any credential succeeds, None otherwise.
+    """
+    for username, password in users.items():
+        try:
+            return decrypt(ciphertext, password, username)
+        except CryptoidError:
+            continue
+    return None
+
+
 def encrypt_file(
     file_path: Path,
     users: dict[str, str],
@@ -299,12 +552,12 @@ def encrypt_file(
     ciphertext = encrypt(body, users, salt=salt)
 
     # Build shortcode with config
-    mode_attr = 'mode="user"'
-    hint_value = _escape_shortcode_attr(config.password_hint or "")
-    hint_attr = f'hint="{hint_value}"'
-    remember_attr = f'remember="{config.remember}"'
-    hash_attr = f'hash="{hash_value}"'
-    shortcode = f"{{{{< cryptoid-encrypted {mode_attr} {hint_attr} {remember_attr} {hash_attr} >}}}}\n{ciphertext}\n{{{{< /cryptoid-encrypted >}}}}"
+    shortcode = _build_shortcode(
+        hint=config.password_hint or "",
+        remember=config.remember,
+        hash_value=hash_value,
+        ciphertext=ciphertext,
+    )
 
     # Rebuild the file with encrypted body
     post.content = shortcode
@@ -350,14 +603,7 @@ def decrypt_file(
     ciphertext = extracted["ciphertext"]
 
     # Try each user credential
-    plaintext = None
-    for username, password in users.items():
-        try:
-            plaintext = decrypt(ciphertext, password, username)
-            break
-        except CryptoidError:
-            continue
-
+    plaintext = _try_decrypt_any_user(ciphertext, users)
     if plaintext is None:
         raise CryptoidError(
             f"Decryption failed for {file_path}: no valid credentials"
@@ -414,12 +660,26 @@ def config():
     help="Path to config file",
 )
 def config_status(config_path: Path):
-    """Show the location of the config file."""
+    """Show the location of config files and their status."""
+    # Global config
+    global_path = _get_global_config_path()
+    if global_path.exists():
+        global_config = _load_global_config()
+        global_users = list(global_config.get("users", {}).keys())
+        click.echo(f"Global config: {global_path}")
+        if global_users:
+            click.echo(f"  Users: {', '.join(global_users)}")
+        if "content_dir" in global_config:
+            click.echo(f"  Content dir: {global_config['content_dir']}")
+    else:
+        click.echo(f"Global config: {global_path} (not found)")
+
+    # Local config
     config_path = config_path.resolve()
-    if not config_path.exists():
-        click.echo(f"Config file not found: {config_path}", err=True)
-        sys.exit(1)
-    click.echo(f"Config file: {config_path}")
+    if config_path.exists():
+        click.echo(f"Local config:  {config_path}")
+    else:
+        click.echo(f"Local config:  {config_path} (not found)")
 
 
 @config.command("show")
@@ -430,27 +690,126 @@ def config_status(config_path: Path):
     default=".cryptoid.yaml",
     help="Path to config file",
 )
-def config_show(config_path: Path):
-    """Display the full configuration file in YAML format."""
+@click.option(
+    "--show-passwords",
+    is_flag=True,
+    help="Show passwords in plaintext (masked by default)",
+)
+def config_show(config_path: Path, show_passwords: bool):
+    """Display the effective configuration with source annotations.
+
+    Shows where each value comes from: local config, global config,
+    or merged from both. Passwords are masked by default.
+    """
     config_path = config_path.resolve()
-    if not config_path.exists():
-        click.echo(f"Config file not found: {config_path}", err=True)
+    has_local = config_path.exists()
+    global_config = _load_global_config()
+    has_global = bool(global_config)
+    global_path = _get_global_config_path()
+
+    if not has_local and not has_global:
+        click.echo("No config found (no local .cryptoid.yaml and no global config).", err=True)
+        click.echo("Run 'cryptoid init' to create a local config.", err=True)
+        click.echo("Run 'cryptoid init --global' to create a global config.", err=True)
         sys.exit(1)
 
-    try:
-        content = config_path.read_text(encoding="utf-8")
-        click.echo(content)
-    except Exception as e:
-        click.echo(f"Error reading config file: {e}", err=True)
-        sys.exit(1)
+    local_config: dict[str, Any] = {}
+    if has_local:
+        try:
+            local_config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except OSError as e:
+            click.echo(f"Error reading config file: {e}", err=True)
+            sys.exit(1)
+
+    # Header: show config file paths
+    if has_local:
+        click.echo(f"Local:  {config_path}")
+    if has_global:
+        click.echo(f"Global: {global_path}")
+    click.echo()
+
+    # Users — show source for each
+    global_users = global_config.get("users", {})
+    local_users = local_config.get("users", {})
+    merged_users = {**global_users, **local_users}
+
+    if merged_users:
+        click.echo("users:")
+        for username, password in merged_users.items():
+            masked = password if show_passwords else (
+                password[:2] + "***" if len(password) > 2 else "***"
+            )
+            if username in local_users and username in global_users:
+                source = "local (overrides global)"
+            elif username in local_users:
+                source = "local"
+            else:
+                source = "global"
+            click.echo(f"  {username}: {masked}  # {source}")
+
+    # Groups — show source for each, with merged members
+    global_groups = global_config.get("groups", {})
+    local_groups = local_config.get("groups", {})
+    all_group_names = list(dict.fromkeys(list(local_groups.keys()) + list(global_groups.keys())))
+
+    if all_group_names:
+        click.echo("groups:")
+        for group_name in all_group_names:
+            g_members = set(str(m) for m in global_groups.get(group_name, []))
+            l_members = set(str(m) for m in local_groups.get(group_name, []))
+            combined = list(dict.fromkeys(
+                [str(m) for m in local_groups.get(group_name, [])] +
+                [str(m) for m in global_groups.get(group_name, [])]
+            ))
+            if g_members and l_members:
+                source = "merged (local + global)"
+            elif l_members:
+                source = "local"
+            else:
+                source = "global"
+            click.echo(f"  {group_name}: [{', '.join(combined)}]  # {source}")
+
+    # Salt — show source
+    local_salt = local_config.get("salt")
+    global_salt = global_config.get("salt")
+    if local_salt:
+        click.echo(f"salt: {local_salt}  # local")
+    elif global_salt:
+        click.echo(f"salt: {global_salt}  # global")
+
+    # Content dir — show source
+    local_cdir = local_config.get("content_dir")
+    global_cdir = global_config.get("content_dir")
+    if local_cdir:
+        click.echo(f"content_dir: {local_cdir}  # local")
+    elif global_cdir:
+        click.echo(f"content_dir: {global_cdir}  # global")
+
+    # Admin — show source
+    local_admin = local_config.get("admin")
+    global_admin = global_config.get("admin")
+    if local_admin:
+        click.echo(f"admin: {local_admin}  # local")
+    elif global_admin:
+        click.echo(f"admin: {global_admin}  # global")
+
+
+def _mask_passwords(users: dict[str, str], show: bool) -> dict[str, str]:
+    """Mask user passwords unless show is True."""
+    if show:
+        return users
+    return {
+        username: password[:2] + "***" if len(password) > 2 else "***"
+        for username, password in users.items()
+    }
 
 
 @config.command("validate")
 @click.option(
     "--content-dir",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default="content",
-    help="Hugo content directory",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Hugo content directory (default: from config or 'content')",
 )
 @click.option(
     "--config",
@@ -459,7 +818,7 @@ def config_show(config_path: Path):
     default=".cryptoid.yaml",
     help="Path to config file",
 )
-def config_validate(content_dir: Path, config_path: Path):
+def config_validate(content_dir: Path | None, config_path: Path):
     """Validate configuration and content consistency.
 
     Checks that the config is well-formed, all group references in content
@@ -471,6 +830,12 @@ def config_validate(content_dir: Path, config_path: Path):
 
     # --- Check 1: Config loading ---
     click.echo("Checking config...")
+    global_path = _get_global_config_path()
+    if global_path.exists():
+        global_cfg = _load_global_config()
+        global_user_count = len(global_cfg.get("users", {}))
+        if global_user_count:
+            click.echo(f"  Global config: {global_path} ({global_user_count} users)")
     try:
         config = load_config(config_path)
         click.echo(f"  Config OK: {len(config['users'])} users, "
@@ -485,6 +850,9 @@ def config_validate(content_dir: Path, config_path: Path):
         errors.append(str(e))
         _print_validate_summary(errors, warnings)
         sys.exit(1)
+
+    # Resolve content directory
+    content_dir = _resolve_content_dir(content_dir, config)
 
     # --- Check 2: Group references in front matter ---
     click.echo("Checking group references...")
@@ -564,14 +932,7 @@ def config_validate(content_dir: Path, config_path: Path):
         expected_hash = extracted["hash"]
 
         # Try decrypting with any available credential
-        plaintext = None
-        for username, password in all_users.items():
-            try:
-                plaintext = decrypt(ciphertext, password, username)
-                break
-            except CryptoidError:
-                continue
-
+        plaintext = _try_decrypt_any_user(ciphertext, all_users)
         if plaintext is None:
             msg = (f"File '{rel}' cannot be decrypted with any "
                    "configured credentials")
@@ -631,12 +992,935 @@ def config_validate(content_dir: Path, config_path: Path):
         sys.exit(1)
 
 
-@main.command()
+@config.command("generate-salt")
+@click.option(
+    "--apply",
+    is_flag=True,
+    help="Write the generated salt to the config file",
+)
+@click.option(
+    "--global",
+    "is_global",
+    is_flag=True,
+    help="Apply to global config",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_generate_salt(apply: bool, is_global: bool, config_path: Path):
+    """Generate a new random salt.
+
+    Prints the hex-encoded salt. With --apply, writes it to the config file.
+    After applying a new salt, run `cryptoid rewrap --rekey` to re-encrypt
+    all content with the new salt.
+    """
+    new_salt = salt_to_hex(generate_salt())
+    click.echo(f"Generated salt: {new_salt}")
+
+    if apply:
+        try:
+            if is_global:
+                raw = _load_raw_global()
+            else:
+                raw = _load_raw_config(config_path)
+        except FileNotFoundError as e:
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+
+        raw["salt"] = new_salt
+        if is_global:
+            _save_global(raw)
+            click.echo(f"Salt written to global config.")
+        else:
+            save_config(config_path, raw)
+            click.echo(f"Salt written to {config_path}")
+        click.echo("Run 'cryptoid rewrap --rekey' to re-encrypt content with the new salt.")
+
+
+@config.command("list-users")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_list_users(config_path: Path):
+    """List all configured users and their group memberships."""
+    try:
+        cfg = load_config(config_path)
+    except (FileNotFoundError, CryptoidError) as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    users = cfg["users"]
+    groups = cfg["groups"]
+
+    if not users:
+        click.echo("No users configured.")
+        return
+
+    # Build user → groups mapping
+    user_groups: dict[str, list[str]] = {u: [] for u in users}
+    for group_name, members in groups.items():
+        for member in members:
+            if member in user_groups:
+                user_groups[member].append(group_name)
+
+    # Column widths
+    max_name = max(len(u) for u in users)
+    max_name = max(max_name, len("USERNAME"))
+    header = f"{'USERNAME':<{max_name}}   GROUPS"
+    click.echo(header)
+
+    for username in users:
+        grps = user_groups[username]
+        grps_str = ", ".join(grps) if grps else "(none)"
+        click.echo(f"{username:<{max_name}}   {grps_str}")
+
+
+@config.command("list-groups")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_list_groups(config_path: Path):
+    """List all configured groups and their members."""
+    try:
+        cfg = load_config(config_path)
+    except (FileNotFoundError, CryptoidError) as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    groups = cfg["groups"]
+
+    if not groups:
+        click.echo("(no groups defined)")
+        return
+
+    # Column widths
+    max_name = max(len(g) for g in groups)
+    max_name = max(max_name, len("GROUP"))
+    header = f"{'GROUP':<{max_name}}   MEMBERS"
+    click.echo(header)
+
+    for group_name, members in groups.items():
+        members_str = ", ".join(members) if members else "(empty)"
+        click.echo(f"{group_name:<{max_name}}   {members_str}")
+
+
+@config.command("add-user")
+@click.argument("username", required=False, default=None)
+@click.option(
+    "--group",
+    "groups",
+    multiple=True,
+    help="Add user to this group (repeatable)",
+)
+@click.option(
+    "--global",
+    "is_global",
+    is_flag=True,
+    help="Add to global config",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_add_user(username: str | None, groups: tuple[str, ...], is_global: bool, config_path: Path):
+    """Add a new user to the configuration.
+
+    If USERNAME is omitted, prompts interactively for username, password,
+    and group membership. After adding a user, run `cryptoid rewrap` to
+    grant them access to encrypted content.
+    """
+    # Load raw config
+    try:
+        if is_global:
+            raw = _load_raw_global()
+        else:
+            raw = _load_raw_config(config_path)
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    existing_groups = raw.get("groups", {})
+
+    # Prompt for username if not provided
+    if username is None:
+        while True:
+            username = click.prompt("Username")
+            try:
+                validate_username(username)
+                break
+            except CryptoidError as e:
+                click.echo(f"Invalid username: {e}")
+    else:
+        try:
+            validate_username(username)
+        except CryptoidError as e:
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+
+    users = raw.get("users", {})
+    if username in users:
+        click.echo(f"Error: User '{username}' already exists", err=True)
+        sys.exit(1)
+
+    # Prompt for password
+    password = click.prompt("Password", hide_input=True, confirmation_prompt=True)
+
+    # Resolve group membership
+    if not groups and existing_groups:
+        # No --group flags: prompt interactively
+        available = list(existing_groups.keys())
+        click.echo(f"Available groups: {', '.join(available)}")
+        group_input = click.prompt(
+            "Add to groups (comma-separated, Enter to skip)",
+            default="",
+            show_default=False,
+        )
+        if group_input.strip():
+            groups = tuple(g.strip() for g in group_input.split(",") if g.strip())
+
+    # Validate requested groups exist
+    for g in groups:
+        if g not in existing_groups:
+            click.echo(f"Error: Group '{g}' does not exist", err=True)
+            sys.exit(1)
+
+    # Add user
+    users[username] = password
+    raw["users"] = users
+
+    # Add to groups
+    for g in groups:
+        if username not in existing_groups[g]:
+            existing_groups[g].append(username)
+    raw["groups"] = existing_groups
+
+    target = "global" if is_global else "local"
+    if is_global:
+        _save_global(raw)
+    else:
+        save_config(config_path, raw)
+    click.echo(f"User '{username}' added ({target}).")
+    if groups:
+        click.echo(f"Added to groups: {', '.join(groups)}")
+    click.echo("Run 'cryptoid rewrap' to grant access to encrypted content.")
+
+
+@config.command("remove-user")
+@click.argument("username")
+@click.option(
+    "--global",
+    "is_global",
+    is_flag=True,
+    help="Remove from global config",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_remove_user(username: str, is_global: bool, config_path: Path):
+    """Remove a user from the configuration.
+
+    Also removes the user from all groups. After removing a user, run
+    `cryptoid rewrap --rekey` to revoke their access.
+    """
+    try:
+        if is_global:
+            raw = _load_raw_global()
+        else:
+            raw = _load_raw_config(config_path)
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    users = raw.get("users", {})
+    if username not in users:
+        # Check if the user exists in the other tier
+        other_tier = "global" if not is_global else "local"
+        merged = _merged_users(raw)
+        if username in merged:
+            click.echo(
+                f"Error: User '{username}' is not in {'global' if is_global else 'local'} config "
+                f"(exists in {other_tier}; use {'--global' if not is_global else '--config'} to remove)",
+                err=True,
+            )
+        else:
+            click.echo(f"Error: User '{username}' not found", err=True)
+        sys.exit(1)
+
+    # Check merged users — removing from one tier is fine if the other has users
+    merged = _merged_users(raw)
+    remaining = {u for u in merged if u != username}
+    if not remaining:
+        click.echo("Error: Cannot remove the last user", err=True)
+        sys.exit(1)
+
+    # Remove from users
+    del users[username]
+    raw["users"] = users
+
+    # Remove from all groups
+    groups = raw.get("groups", {})
+    for group_name, members in groups.items():
+        if username in members:
+            members.remove(username)
+            if not members:
+                click.echo(f"Warning: Group '{group_name}' is now empty")
+
+    raw["groups"] = groups
+    target = "global" if is_global else "local"
+    if is_global:
+        _save_global(raw)
+    else:
+        save_config(config_path, raw)
+    click.echo(f"User '{username}' removed ({target}).")
+    click.echo("Run 'cryptoid rewrap --rekey' to revoke access to encrypted content.")
+
+
+@config.command("add-group")
+@click.argument("name")
+@click.option(
+    "--members",
+    default="",
+    help="Comma-separated list of usernames to add as members",
+)
+@click.option(
+    "--global",
+    "is_global",
+    is_flag=True,
+    help="Add to global config",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_add_group(name: str, members: str, is_global: bool, config_path: Path):
+    """Add a new group to the configuration."""
+    try:
+        if is_global:
+            raw = _load_raw_global()
+        else:
+            raw = _load_raw_config(config_path)
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    groups = raw.get("groups", {})
+    if name in groups:
+        click.echo(f"Error: Group '{name}' already exists", err=True)
+        sys.exit(1)
+
+    all_users = _merged_users(raw)
+
+    # Parse and validate members
+    member_list = [m.strip() for m in members.split(",") if m.strip()] if members else []
+    for m in member_list:
+        if m not in all_users:
+            click.echo(f"Error: User '{m}' not found in config", err=True)
+            sys.exit(1)
+
+    groups[name] = member_list
+    raw["groups"] = groups
+    target = "global" if is_global else "local"
+    if is_global:
+        _save_global(raw)
+    else:
+        save_config(config_path, raw)
+
+    if member_list:
+        click.echo(f"Group '{name}' created with members: {', '.join(member_list)} ({target})")
+    else:
+        click.echo(f"Group '{name}' created (empty, {target}).")
+
+
+@config.command("remove-group")
+@click.argument("name")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Allow removing the admin group",
+)
 @click.option(
     "--content-dir",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default="content",
-    help="Hugo content directory",
+    default=None,
+    help="Scan content directory for group references before removing",
+)
+@click.option(
+    "--global",
+    "is_global",
+    is_flag=True,
+    help="Remove from global config",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_remove_group(name: str, force: bool, content_dir: Path | None, is_global: bool, config_path: Path):
+    """Remove a group from the configuration.
+
+    Refuses to remove the 'admin' group unless --force is given.
+    After removing a group, run `cryptoid rewrap` to update encrypted content.
+    """
+    try:
+        if is_global:
+            raw = _load_raw_global()
+        else:
+            raw = _load_raw_config(config_path)
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    groups = raw.get("groups", {})
+    if name not in groups:
+        click.echo(f"Error: Group '{name}' not found", err=True)
+        sys.exit(1)
+
+    if name == "admin" and not force:
+        click.echo(
+            "Error: Refusing to remove 'admin' group. Use --force to override.",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Scan content for references if content-dir provided
+    if content_dir is not None:
+        referencing_files = []
+        for md_file in sorted(content_dir.rglob("*.md")):
+            content = md_file.read_text(encoding="utf-8")
+            fm, _ = parse_markdown(content)
+            file_groups = fm.get("groups")
+            if file_groups:
+                if isinstance(file_groups, str):
+                    file_groups = [file_groups]
+                if name in file_groups:
+                    referencing_files.append(md_file.relative_to(content_dir))
+
+        if referencing_files:
+            click.echo(f"Warning: Group '{name}' is referenced by:")
+            for f in referencing_files:
+                click.echo(f"  {f}")
+
+    del groups[name]
+    raw["groups"] = groups
+    target = "global" if is_global else "local"
+    if is_global:
+        _save_global(raw)
+    else:
+        save_config(config_path, raw)
+    click.echo(f"Group '{name}' removed ({target}).")
+    click.echo("Run 'cryptoid rewrap' to update encrypted content.")
+
+
+@config.command("add-to-group")
+@click.argument("group")
+@click.argument("username")
+@click.option(
+    "--global",
+    "is_global",
+    is_flag=True,
+    help="Modify global config",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_add_to_group(group: str, username: str, is_global: bool, config_path: Path):
+    """Add an existing user to an existing group.
+
+    \b
+    Examples:
+      cryptoid config add-to-group team alice
+      cryptoid config add-to-group team alice --global
+    """
+    try:
+        if is_global:
+            raw = _load_raw_global()
+        else:
+            raw = _load_raw_config(config_path)
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    all_users = _merged_users(raw)
+    groups = raw.get("groups", {})
+
+    if username not in all_users:
+        click.echo(f"Error: User '{username}' not found", err=True)
+        sys.exit(1)
+
+    if group not in groups:
+        click.echo(f"Error: Group '{group}' not found", err=True)
+        sys.exit(1)
+
+    if username in groups[group]:
+        click.echo(f"User '{username}' is already in group '{group}'.")
+        return
+
+    groups[group].append(username)
+    raw["groups"] = groups
+    target = "global" if is_global else "local"
+    if is_global:
+        _save_global(raw)
+    else:
+        save_config(config_path, raw)
+    click.echo(f"Added '{username}' to group '{group}' ({target}).")
+    click.echo("Run 'cryptoid rewrap' to update encrypted content.")
+
+
+@config.command("remove-from-group")
+@click.argument("group")
+@click.argument("username")
+@click.option(
+    "--global",
+    "is_global",
+    is_flag=True,
+    help="Modify global config",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to config file",
+)
+def config_remove_from_group(group: str, username: str, is_global: bool, config_path: Path):
+    """Remove a user from a group (without deleting the user).
+
+    \b
+    Examples:
+      cryptoid config remove-from-group team alice
+      cryptoid config remove-from-group team alice --global
+    """
+    try:
+        if is_global:
+            raw = _load_raw_global()
+        else:
+            raw = _load_raw_config(config_path)
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    groups = raw.get("groups", {})
+
+    if group not in groups:
+        click.echo(f"Error: Group '{group}' not found", err=True)
+        sys.exit(1)
+
+    if username not in groups[group]:
+        click.echo(f"Error: User '{username}' is not in group '{group}'", err=True)
+        sys.exit(1)
+
+    groups[group].remove(username)
+    if not groups[group]:
+        click.echo(f"Warning: Group '{group}' is now empty")
+    raw["groups"] = groups
+    target = "global" if is_global else "local"
+    if is_global:
+        _save_global(raw)
+    else:
+        save_config(config_path, raw)
+    click.echo(f"Removed '{username}' from group '{group}' ({target}).")
+    click.echo("Run 'cryptoid rewrap' to update encrypted content.")
+
+
+def _load_raw_global() -> dict[str, Any]:
+    """Load global config without validation, for mutation."""
+    path = _get_global_config_path()
+    if not path.exists():
+        raise FileNotFoundError(f"Global config not found: {path}")
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _save_global(data: dict[str, Any]) -> None:
+    """Write global config back to disk."""
+    path = _get_global_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+
+@config.command("set-content-dir")
+@click.argument("path", type=click.Path())
+@click.option(
+    "--global",
+    "is_global",
+    is_flag=True,
+    help="Set in global config (~/.config/cryptoid/config.yaml)",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to local config file",
+)
+def config_set_content_dir(path: str, is_global: bool, config_path: Path):
+    """Set the Hugo content directory.
+
+    PATH is the relative or absolute path to the Hugo content directory.
+    It is stored in the config and used by encrypt, decrypt, status, and rewrap
+    when --content-dir is not specified on the command line.
+
+    \b
+    Examples:
+      cryptoid config set-content-dir content/       # Set in local config
+      cryptoid config set-content-dir content/ --global  # Set in global config
+    """
+    if is_global:
+        try:
+            raw = _load_raw_global()
+        except FileNotFoundError:
+            click.echo("Error: no global config. Run 'cryptoid init --global' first.", err=True)
+            sys.exit(1)
+        raw["content_dir"] = path
+        _save_global(raw)
+        click.echo(f"content_dir set to: {path} (global)")
+    else:
+        try:
+            raw = _load_raw_config(config_path)
+        except FileNotFoundError:
+            click.echo(f"Error: {config_path} not found. Run 'cryptoid init' first.", err=True)
+            sys.exit(1)
+        raw["content_dir"] = path
+        save_config(config_path, raw)
+        click.echo(f"content_dir set to: {path}")
+
+
+@config.command("set-admin")
+@click.argument("username", required=False)
+@click.option(
+    "--unset",
+    is_flag=True,
+    help="Remove the admin setting",
+)
+@click.option(
+    "--global",
+    "is_global",
+    is_flag=True,
+    help="Set in global config (~/.config/cryptoid/config.yaml)",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to local config file",
+)
+def config_set_admin(username: str | None, unset: bool, is_global: bool, config_path: Path):
+    """Set or remove the admin user.
+
+    The admin user always gets access to all encrypted content, regardless
+    of group membership. Typically set in the global config so it applies
+    to all projects.
+
+    \b
+    Examples:
+      cryptoid config set-admin alice            # Set in local config
+      cryptoid config set-admin alice --global   # Set in global config
+      cryptoid config set-admin --unset          # Remove from local
+      cryptoid config set-admin --unset --global # Remove from global
+    """
+    if unset and username:
+        click.echo("Error: cannot use --unset with a username.", err=True)
+        sys.exit(1)
+
+    if not unset and not username:
+        click.echo("Error: provide a username or use --unset.", err=True)
+        sys.exit(1)
+
+    # Load the target config
+    if is_global:
+        try:
+            raw = _load_raw_global()
+        except FileNotFoundError:
+            click.echo("Error: no global config. Run 'cryptoid init --global' first.", err=True)
+            sys.exit(1)
+        target_label = "global"
+    else:
+        try:
+            raw = _load_raw_config(config_path)
+        except FileNotFoundError:
+            click.echo(f"Error: {config_path} not found. Run 'cryptoid init' first.", err=True)
+            sys.exit(1)
+        target_label = "local"
+
+    if unset:
+        if "admin" in raw:
+            del raw["admin"]
+            if is_global:
+                _save_global(raw)
+            else:
+                save_config(config_path, raw)
+            click.echo(f"admin setting removed ({target_label}).")
+        else:
+            click.echo(f"No admin setting to remove ({target_label}).")
+        return
+
+    # Validate username exists in merged users
+    try:
+        config = load_config(config_path)
+    except FileNotFoundError:
+        # No local config — check global users only
+        config = {"users": _load_global_config().get("users", {})}
+
+    if username not in config["users"]:
+        available = ", ".join(config["users"].keys()) if config["users"] else "(none)"
+        click.echo(
+            f"Error: user '{username}' not found in config. "
+            f"Available users: {available}",
+            err=True,
+        )
+        sys.exit(1)
+
+    raw["admin"] = username
+    if is_global:
+        _save_global(raw)
+    else:
+        save_config(config_path, raw)
+    click.echo(f"admin set to: {username} ({target_label})")
+
+
+# =============================================================================
+# Init command
+# =============================================================================
+
+
+
+def _init_global(force: bool, default_content_dir: Path | None) -> None:
+    """Create a global user configuration."""
+    global_path = _get_global_config_path()
+
+    if global_path.exists() and not force:
+        click.echo(
+            f"Error: {global_path} already exists. Use --force to overwrite.",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Prompt for user credentials
+    while True:
+        username = click.prompt("Username")
+        try:
+            validate_username(username)
+            break
+        except CryptoidError as e:
+            click.echo(f"Invalid username: {e}")
+
+    password = click.prompt("Password", hide_input=True, confirmation_prompt=True)
+
+    # Prompt for default content dir if not given via flag
+    if default_content_dir is None:
+        dir_input = click.prompt(
+            "Default content directory (Enter to skip)",
+            default="",
+            show_default=False,
+        )
+        if dir_input.strip():
+            default_content_dir = Path(dir_input.strip())
+
+    # Build config
+    config_data: dict[str, Any] = {
+        "users": {username: password},
+    }
+    if default_content_dir is not None:
+        config_data["content_dir"] = str(default_content_dir)
+
+    # Create parent directory
+    global_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write config
+    with open(global_path, "w", encoding="utf-8") as f:
+        yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
+
+    click.echo(f"Created {global_path}")
+    click.echo(f"  User: {username}")
+    if default_content_dir:
+        click.echo(f"  Content dir: {default_content_dir}")
+    click.echo()
+    click.echo("Your credentials will be merged into every project's config.")
+
+
+@main.command()
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Config file name to create",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite existing config file",
+)
+@click.option(
+    "--global",
+    "is_global",
+    is_flag=True,
+    help="Create global user config (~/.config/cryptoid/config.yaml)",
+)
+@click.option(
+    "--content-dir",
+    "default_content_dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Default Hugo content directory (global config only)",
+)
+def init(config_path: Path, force: bool, is_global: bool, default_content_dir: Path | None):
+    """Initialize a new cryptoid configuration.
+
+    Creates a .cryptoid.yaml config file with a salt for this project.
+    Users are inherited from your global config if available.
+
+    With --global, creates ~/.config/cryptoid/config.yaml with your personal
+    credentials that are automatically merged into every project's config.
+    """
+    if is_global:
+        _init_global(force=force, default_content_dir=default_content_dir)
+        return
+
+    if config_path.exists() and not force:
+        click.echo(
+            f"Error: {config_path} already exists. Use --force to overwrite.",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Check for global users
+    global_config = _load_global_config()
+    global_users = global_config.get("users", {})
+
+    config_data: dict[str, Any] = {
+        "salt": salt_to_hex(generate_salt()),
+    }
+
+    if global_users:
+        click.echo(f"Global users available: {', '.join(global_users.keys())}")
+        add_local = click.confirm("Add a local user?", default=False)
+    else:
+        click.echo("No global config found — need at least one user.")
+        add_local = True
+
+    if add_local:
+        while True:
+            username = click.prompt("Username")
+            try:
+                validate_username(username)
+                break
+            except CryptoidError as e:
+                click.echo(f"Invalid username: {e}")
+
+        password = click.prompt("Password", hide_input=True, confirmation_prompt=True)
+        config_data["users"] = {username: password}
+        config_data["groups"] = {"admin": [username]}
+
+    # Content directory
+    global_cdir = global_config.get("content_dir")
+    if global_cdir:
+        click.echo(f"Content directory: {global_cdir} (from global config)")
+        set_local_cdir = click.confirm("Set a different local content directory?", default=False)
+    else:
+        set_local_cdir = True
+
+    if set_local_cdir:
+        cdir_input = click.prompt(
+            "Content directory",
+            default="content",
+        )
+        cdir_input = cdir_input.strip()
+        if cdir_input:
+            config_data["content_dir"] = cdir_input
+
+    # Optional group
+    add_group = click.confirm("Create a group?", default=False)
+    if add_group:
+        group_name = click.prompt("Group name")
+        group_name = group_name.strip()
+        if group_name:
+            # Add all known users (local + global) as members
+            all_users = list(global_users.keys())
+            if "users" in config_data:
+                all_users.extend(config_data["users"].keys())
+            if all_users:
+                click.echo(f"Available users: {', '.join(all_users)}")
+                members_input = click.prompt(
+                    "Members (comma-separated, Enter for all)",
+                    default="",
+                    show_default=False,
+                )
+                if members_input.strip():
+                    members = [m.strip() for m in members_input.split(",") if m.strip()]
+                else:
+                    members = all_users
+            else:
+                members = []
+
+            if "groups" not in config_data:
+                config_data["groups"] = {}
+            config_data["groups"][group_name] = members
+
+    save_config(config_path, config_data)
+    click.echo(f"Created {config_path}")
+    click.echo(f"  Salt: {config_data['salt'][:8]}...")
+    if "content_dir" in config_data:
+        click.echo(f"  Content dir: {config_data['content_dir']}")
+    if "users" in config_data:
+        click.echo(f"  Local users: {', '.join(config_data['users'].keys())}")
+    if "groups" in config_data:
+        click.echo(f"  Groups: {', '.join(config_data['groups'].keys())}")
+
+    # Add to .gitignore (same directory as config file)
+    gitignore = config_path.parent / ".gitignore"
+    config_name = config_path.name
+    if gitignore.exists():
+        content = gitignore.read_text(encoding="utf-8")
+        if config_name not in content.splitlines():
+            with open(gitignore, "a", encoding="utf-8") as f:
+                if not content.endswith("\n"):
+                    f.write("\n")
+                f.write(f"{config_name}\n")
+            click.echo(f"Added '{config_name}' to .gitignore")
+        else:
+            click.echo(f"'{config_name}' already in .gitignore")
+    else:
+        gitignore.write_text(f"{config_name}\n", encoding="utf-8")
+        click.echo(f"Created .gitignore with '{config_name}'")
+
+
+@main.command()
+@click.option(
+    "--content-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Hugo content directory (default: from config or 'content')",
 )
 @click.option(
     "--config",
@@ -650,7 +1934,7 @@ def config_validate(content_dir: Path, config_path: Path):
     is_flag=True,
     help="Show what would be encrypted without making changes",
 )
-def encrypt_cmd(content_dir: Path, config_path: Path, dry_run: bool):
+def encrypt_cmd(content_dir: Path | None, config_path: Path, dry_run: bool):
     """Encrypt marked content files.
 
     Processes all .md files in content-dir that have `encrypted: true`
@@ -662,6 +1946,7 @@ def encrypt_cmd(content_dir: Path, config_path: Path, dry_run: bool):
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
+    content_dir = _resolve_content_dir(content_dir, config)
     salt = config["salt_bytes"]
     encrypted_count = 0
     skipped_count = 0
@@ -755,9 +2040,9 @@ def encrypt_cmd(content_dir: Path, config_path: Path, dry_run: bool):
 @main.command()
 @click.option(
     "--content-dir",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default="content",
-    help="Hugo content directory",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Hugo content directory (default: from config or 'content')",
 )
 @click.option(
     "--config",
@@ -766,7 +2051,7 @@ def encrypt_cmd(content_dir: Path, config_path: Path, dry_run: bool):
     default=".cryptoid.yaml",
     help="Path to config file",
 )
-def decrypt_cmd(content_dir: Path, config_path: Path):
+def decrypt_cmd(content_dir: Path | None, config_path: Path):
     """Decrypt encrypted content files.
 
     Restores original plaintext for files that were encrypted with the
@@ -778,6 +2063,7 @@ def decrypt_cmd(content_dir: Path, config_path: Path):
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
+    content_dir = _resolve_content_dir(content_dir, config)
     all_users = config["users"]
 
     decrypted_count = 0
@@ -828,9 +2114,9 @@ main.add_command(decrypt_cmd, name="decrypt")
 @main.command()
 @click.option(
     "--content-dir",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default="content",
-    help="Hugo content directory",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Hugo content directory (default: from config or 'content')",
 )
 @click.option(
     "--config",
@@ -844,7 +2130,7 @@ main.add_command(decrypt_cmd, name="decrypt")
     is_flag=True,
     help="Show summary statistics",
 )
-def status(content_dir: Path, config_path: Path, verbose: bool):
+def status(content_dir: Path | None, config_path: Path, verbose: bool):
     """Show encryption status of content files.
 
     Lists each file's encryption state, groups, and whether settings
@@ -855,6 +2141,8 @@ def status(content_dir: Path, config_path: Path, verbose: bool):
     except (FileNotFoundError, CryptoidError) as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+    content_dir = _resolve_content_dir(content_dir, config)
 
     encrypted_files = []
     plain_files = []
@@ -932,9 +2220,9 @@ def status(content_dir: Path, config_path: Path, verbose: bool):
 @main.command()
 @click.option(
     "--content-dir",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default="content",
-    help="Hugo content directory",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Hugo content directory (default: from config or 'content')",
 )
 @click.option(
     "--config",
@@ -948,7 +2236,7 @@ def status(content_dir: Path, config_path: Path, verbose: bool):
     is_flag=True,
     help="Generate new CEK and re-encrypt content (forward secrecy)",
 )
-def rewrap(content_dir: Path, config_path: Path, rekey: bool):
+def rewrap(content_dir: Path | None, config_path: Path, rekey: bool):
     """Re-wrap encrypted files for current user configuration.
 
     Use after modifying users/groups in config. With --rekey, generates
@@ -959,6 +2247,8 @@ def rewrap(content_dir: Path, config_path: Path, rekey: bool):
     except (FileNotFoundError, CryptoidError) as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+    content_dir = _resolve_content_dir(content_dir, config)
 
     all_users = config["users"]
     salt = config["salt_bytes"]
@@ -1006,12 +2296,12 @@ def rewrap(content_dir: Path, config_path: Path, rekey: bool):
             continue
 
         # Rebuild shortcode
-        mode_attr = 'mode="user"'
-        hint_value = _escape_shortcode_attr(extracted["hint"])
-        hint_attr = f'hint="{hint_value}"'
-        remember_attr = f'remember="{extracted["remember"]}"'
-        hash_attr = f'hash="{extracted["hash"]}"'
-        shortcode = f"{{{{< cryptoid-encrypted {mode_attr} {hint_attr} {remember_attr} {hash_attr} >}}}}\n{new_payload}\n{{{{< /cryptoid-encrypted >}}}}"
+        shortcode = _build_shortcode(
+            hint=extracted["hint"],
+            remember=extracted["remember"],
+            hash_value=extracted["hash"],
+            ciphertext=new_payload,
+        )
 
         # Replace shortcode in file
         post = frontmatter.loads(content)
@@ -1089,8 +2379,9 @@ def _protect_directory(
 ) -> None:
     """Create or update _index.md in a directory to enable encryption cascade."""
     index_path = dir_path / "_index.md"
+    is_update = index_path.exists()
 
-    if index_path.exists():
+    if is_update:
         content = index_path.read_text(encoding="utf-8")
         post = frontmatter.loads(content)
     else:
@@ -1111,7 +2402,7 @@ def _protect_directory(
     index_path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
     groups_info = list(groups) if groups else post.metadata.get("groups", ["all"])
-    action = "Updated" if index_path.exists() else "Created"
+    action = "Updated" if is_update else "Created"
     click.echo(f"{action} {index_path}")
     click.echo(f"  encrypted: true, groups: {groups_info}")
     click.echo()
@@ -1292,7 +2583,8 @@ def _get_cryptoid_files(site_dir: Path) -> dict[str, Path]:
     """Get paths to cryptoid files in a Hugo site."""
     return {
         "shortcode": site_dir / "layouts" / "shortcodes" / "cryptoid-encrypted.html",
-        "js": site_dir / "assets" / "js" / "cryptoid.js",
+        "js": site_dir / "static" / "js" / "cryptoid.js",
+        "marked": site_dir / "static" / "js" / "marked.min.js",
     }
 
 
@@ -1300,8 +2592,30 @@ def _get_source_files() -> dict[str, Path]:
     """Get paths to source cryptoid files bundled with the package."""
     return {
         "shortcode": HUGO_FILES_DIR / "layouts" / "shortcodes" / "cryptoid-encrypted.html",
-        "js": HUGO_FILES_DIR / "assets" / "js" / "cryptoid.js",
+        "js": HUGO_FILES_DIR / "static" / "js" / "cryptoid.js",
+        "marked": HUGO_FILES_DIR / "static" / "js" / "marked.min.js",
     }
+
+
+def _resolve_hugo_site(site_dir: Path | None) -> Path:
+    """Resolve and validate the Hugo site directory.
+
+    Auto-detects site root if not specified, validates if given explicitly.
+
+    Returns:
+        Validated Hugo site root path.
+
+    Exits with code 1 if no valid Hugo site is found.
+    """
+    if site_dir is None:
+        site_dir = _find_hugo_root(Path.cwd())
+        if site_dir is None:
+            click.echo("Error: Not in a Hugo site (no hugo.toml/config.toml found)", err=True)
+            sys.exit(1)
+    elif not _is_hugo_site(site_dir):
+        click.echo(f"Error: {site_dir} is not a Hugo site (no hugo.toml/config.toml found)", err=True)
+        sys.exit(1)
+    return site_dir
 
 
 @main.group()
@@ -1319,14 +2633,7 @@ def hugo():
 )
 def hugo_status(site_dir: Path | None):
     """Check cryptoid installation status in Hugo site."""
-    if site_dir is None:
-        site_dir = _find_hugo_root(Path.cwd())
-        if site_dir is None:
-            click.echo("Error: Not in a Hugo site (no hugo.toml/config.toml found)", err=True)
-            sys.exit(1)
-    elif not _is_hugo_site(site_dir):
-        click.echo(f"Error: {site_dir} is not a Hugo site (no hugo.toml/config.toml found)", err=True)
-        sys.exit(1)
+    site_dir = _resolve_hugo_site(site_dir)
 
     click.echo(f"Hugo site: {site_dir}")
     click.echo()
@@ -1357,14 +2664,7 @@ def hugo_status(site_dir: Path | None):
 )
 def hugo_install(site_dir: Path | None):
     """Install cryptoid shortcode and JavaScript into Hugo site."""
-    if site_dir is None:
-        site_dir = _find_hugo_root(Path.cwd())
-        if site_dir is None:
-            click.echo("Error: Not in a Hugo site (no hugo.toml/config.toml found)", err=True)
-            sys.exit(1)
-    elif not _is_hugo_site(site_dir):
-        click.echo(f"Error: {site_dir} is not a Hugo site (no hugo.toml/config.toml found)", err=True)
-        sys.exit(1)
+    site_dir = _resolve_hugo_site(site_dir)
 
     click.echo(f"Installing cryptoid to: {site_dir}")
 
@@ -1395,14 +2695,7 @@ def hugo_install(site_dir: Path | None):
 )
 def hugo_uninstall(site_dir: Path | None):
     """Remove cryptoid files from Hugo site."""
-    if site_dir is None:
-        site_dir = _find_hugo_root(Path.cwd())
-        if site_dir is None:
-            click.echo("Error: Not in a Hugo site (no hugo.toml/config.toml found)", err=True)
-            sys.exit(1)
-    elif not _is_hugo_site(site_dir):
-        click.echo(f"Error: {site_dir} is not a Hugo site (no hugo.toml/config.toml found)", err=True)
-        sys.exit(1)
+    site_dir = _resolve_hugo_site(site_dir)
 
     click.echo(f"Uninstalling cryptoid from: {site_dir}")
 

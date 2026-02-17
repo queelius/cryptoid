@@ -10,8 +10,11 @@ from cryptoid.cli import (
     decrypt_file,
     resolve_encryption,
     resolve_users,
+    _try_decrypt_any_user,
+    _build_shortcode,
+    _resolve_hugo_site,
 )
-from cryptoid.crypto import CryptoidError
+from cryptoid.crypto import CryptoidError, encrypt
 from cryptoid.frontmatter import is_already_encrypted
 
 
@@ -1409,3 +1412,110 @@ Secret content.
         encrypt_file(md_file, users)
         content = md_file.read_text()
         assert 'hint="A normal hint"' in content
+
+
+# =============================================================================
+# Helper function tests
+# =============================================================================
+
+
+class TestTryDecryptAnyUser:
+    """Test _try_decrypt_any_user() helper."""
+
+    def test_returns_plaintext_on_match(self):
+        """Returns plaintext when a matching credential is found."""
+        users = {"alice": "pass-a", "bob": "pass-b"}
+        ciphertext = encrypt("secret message", users)
+        result = _try_decrypt_any_user(ciphertext, users)
+        assert result == "secret message"
+
+    def test_returns_none_on_no_match(self):
+        """Returns None when no credential matches."""
+        users = {"alice": "pass-a"}
+        ciphertext = encrypt("secret message", users)
+        result = _try_decrypt_any_user(ciphertext, {"bob": "wrong-pass"})
+        assert result is None
+
+    def test_succeeds_with_partial_user_overlap(self):
+        """Succeeds if any user in the set can decrypt."""
+        users = {"alice": "pass-a"}
+        ciphertext = encrypt("secret message", users)
+        result = _try_decrypt_any_user(
+            ciphertext, {"wrong": "nope", "alice": "pass-a"}
+        )
+        assert result == "secret message"
+
+
+class TestBuildShortcode:
+    """Test _build_shortcode() helper."""
+
+    def test_basic_shortcode(self):
+        """Produces a well-formed shortcode."""
+        result = _build_shortcode(
+            hint="Ask admin", remember="ask", hash_value="abc123", ciphertext="PAYLOAD"
+        )
+        assert '{{< cryptoid-encrypted' in result
+        assert 'mode="user"' in result
+        assert 'hint="Ask admin"' in result
+        assert 'remember="ask"' in result
+        assert 'hash="abc123"' in result
+        assert "PAYLOAD" in result
+        assert '{{< /cryptoid-encrypted >}}' in result
+
+    def test_shortcode_escapes_quotes(self):
+        """Quotes in hint are stripped."""
+        result = _build_shortcode(
+            hint='say "hello"', remember="ask", hash_value="x", ciphertext="Y"
+        )
+        assert 'hint="say hello"' in result
+        assert '"hello"' not in result.replace('hint="say hello"', '')
+
+
+class TestResolveHugoSite:
+    """Test _resolve_hugo_site() helper."""
+
+    def test_exits_on_missing_site(self, tmp_path):
+        """Exits with SystemExit when no Hugo site found."""
+        # tmp_path has no hugo.toml
+        with pytest.raises(SystemExit):
+            _resolve_hugo_site(tmp_path / "nonexistent")
+
+    def test_returns_valid_site_dir(self, tmp_path):
+        """Returns the site dir when it's a valid Hugo site."""
+        (tmp_path / "hugo.toml").write_text("[build]\n")
+        result = _resolve_hugo_site(tmp_path)
+        assert result == tmp_path
+
+
+class TestProtectDirectoryMessage:
+    """Test that _protect_directory correctly reports Created vs Updated."""
+
+    def test_created_message_on_new_index(self, runner, tmp_path):
+        """Reports 'Created' when _index.md doesn't exist yet."""
+        content_dir = tmp_path / "content" / "new-section"
+        content_dir.mkdir(parents=True)
+
+        result = runner.invoke(main, [
+            "protect", str(content_dir), "--groups", "team",
+        ])
+
+        assert result.exit_code == 0
+        assert "Created" in result.output
+
+    def test_updated_message_on_existing_index(self, runner, tmp_path):
+        """Reports 'Updated' when _index.md already exists."""
+        content_dir = tmp_path / "content" / "existing"
+        content_dir.mkdir(parents=True)
+        (content_dir / "_index.md").write_text("""---
+title: "Existing"
+---
+
+Some content.
+""")
+
+        result = runner.invoke(main, [
+            "protect", str(content_dir), "--groups", "team",
+        ])
+
+        assert result.exit_code == 0
+        assert "Updated" in result.output

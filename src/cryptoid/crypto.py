@@ -8,6 +8,7 @@ CEK wrapped per-user with PBKDF2-derived wrapping keys.
 """
 
 import base64
+import binascii
 import hashlib
 import json
 import os
@@ -193,7 +194,7 @@ def decrypt(ciphertext: str, password: str, username: str) -> str:
     # Decode base64
     try:
         decoded = base64.b64decode(ciphertext)
-    except Exception as e:
+    except (binascii.Error, ValueError) as e:
         raise CryptoidError(f"Invalid base64 encoding: {e}") from e
 
     # Parse JSON
@@ -217,7 +218,7 @@ def decrypt(ciphertext: str, password: str, username: str) -> str:
         salt = base64.b64decode(data["salt"])
         content_iv = base64.b64decode(data["iv"])
         content_ct = base64.b64decode(data["ct"])
-    except Exception as e:
+    except (binascii.Error, ValueError) as e:
         raise CryptoidError(f"Invalid base64 in payload fields: {e}") from e
 
     keys_list = data["keys"]
@@ -234,7 +235,7 @@ def decrypt(ciphertext: str, password: str, username: str) -> str:
         try:
             blob_iv = base64.b64decode(key_blob["iv"])
             blob_ct = base64.b64decode(key_blob["ct"])
-        except Exception:
+        except (KeyError, binascii.Error, ValueError):
             continue
         result = _unwrap_key(blob_iv, blob_ct, wrapping_key)
         if result is not None:
@@ -298,7 +299,7 @@ def rewrap_keys(
     try:
         decoded = base64.b64decode(encrypted_payload)
         data: dict[str, Any] = json.loads(decoded)
-    except Exception as e:
+    except (binascii.Error, ValueError, json.JSONDecodeError) as e:
         raise CryptoidError(f"Invalid payload: {e}") from e
 
     if data.get("v") != VERSION:

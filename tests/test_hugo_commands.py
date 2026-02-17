@@ -20,7 +20,7 @@ def hugo_site(tmp_path):
     (site / "hugo.toml").write_text('baseURL = "https://example.com/"\n')
     (site / "content").mkdir()
     (site / "layouts").mkdir()
-    (site / "assets").mkdir()
+    (site / "static").mkdir()
     return site
 
 
@@ -31,7 +31,7 @@ def hugo_site_with_cryptoid(hugo_site):
     shortcode_dir.mkdir()
     (shortcode_dir / "cryptoid-encrypted.html").write_text("<!-- cryptoid v0.1.0 -->")
 
-    js_dir = hugo_site / "assets" / "js"
+    js_dir = hugo_site / "static" / "js"
     js_dir.mkdir()
     (js_dir / "cryptoid.js").write_text("// cryptoid v0.1.0")
 
@@ -82,17 +82,19 @@ class TestHugoInstall:
 
         assert result.exit_code == 0
         assert (hugo_site / "layouts" / "shortcodes" / "cryptoid-encrypted.html").exists()
-        assert (hugo_site / "assets" / "js" / "cryptoid.js").exists()
+        assert (hugo_site / "static" / "js" / "cryptoid.js").exists()
+        assert (hugo_site / "static" / "js" / "marked.min.js").exists()
 
     def test_install_creates_directories(self, runner, hugo_site):
         """Install creates shortcodes/js directories if missing."""
-        # Remove assets dir
-        (hugo_site / "assets").rmdir()
+        # Remove static dir
+        (hugo_site / "static").rmdir()
 
         result = runner.invoke(main, ["hugo", "install", "--site-dir", str(hugo_site)])
 
         assert result.exit_code == 0
-        assert (hugo_site / "assets" / "js" / "cryptoid.js").exists()
+        assert (hugo_site / "static" / "js" / "cryptoid.js").exists()
+        assert (hugo_site / "static" / "js" / "marked.min.js").exists()
 
     def test_install_overwrites_existing(self, runner, hugo_site_with_cryptoid):
         """Install overwrites existing cryptoid files."""
@@ -125,13 +127,14 @@ class TestHugoUninstall:
 
         assert result.exit_code == 0
         assert not (hugo_site_with_cryptoid / "layouts" / "shortcodes" / "cryptoid-encrypted.html").exists()
-        assert not (hugo_site_with_cryptoid / "assets" / "js" / "cryptoid.js").exists()
+        assert not (hugo_site_with_cryptoid / "static" / "js" / "cryptoid.js").exists()
+        assert not (hugo_site_with_cryptoid / "static" / "js" / "marked.min.js").exists()
 
     def test_uninstall_preserves_other_files(self, runner, hugo_site_with_cryptoid):
         """Uninstall doesn't remove other shortcodes/js."""
         # Add another shortcode
         (hugo_site_with_cryptoid / "layouts" / "shortcodes" / "other.html").write_text("other")
-        (hugo_site_with_cryptoid / "assets" / "js" / "main.js").write_text("main")
+        (hugo_site_with_cryptoid / "static" / "js" / "main.js").write_text("main")
 
         runner.invoke(main, [
             "hugo", "uninstall",
@@ -139,7 +142,7 @@ class TestHugoUninstall:
         ])
 
         assert (hugo_site_with_cryptoid / "layouts" / "shortcodes" / "other.html").exists()
-        assert (hugo_site_with_cryptoid / "assets" / "js" / "main.js").exists()
+        assert (hugo_site_with_cryptoid / "static" / "js" / "main.js").exists()
 
     def test_uninstall_when_not_installed(self, runner, hugo_site):
         """Uninstall succeeds even if not installed."""

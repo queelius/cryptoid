@@ -184,7 +184,11 @@
     }
 
     if (storage) {
-      storage.setItem(key, JSON.stringify({ u: username || "", p: password }));
+      try {
+        storage.setItem(key, JSON.stringify({ u: username || "", p: password }));
+      } catch (e) {
+        // Storage may be unavailable (incognito mode, quota exceeded, disabled)
+      }
     }
   }
 
@@ -194,7 +198,14 @@
    */
   function getSavedCredentials(containerId) {
     const key = getStorageKey(containerId);
-    const raw = localStorage.getItem(key) || sessionStorage.getItem(key);
+
+    let raw;
+    try {
+      raw = localStorage.getItem(key) || sessionStorage.getItem(key);
+    } catch (e) {
+      // Storage may be unavailable (incognito mode, disabled)
+      return null;
+    }
     if (!raw) return null;
 
     try {
@@ -217,8 +228,12 @@
    */
   function clearSavedCredentials(containerId) {
     const key = getStorageKey(containerId);
-    localStorage.removeItem(key);
-    sessionStorage.removeItem(key);
+    try {
+      localStorage.removeItem(key);
+      sessionStorage.removeItem(key);
+    } catch (e) {
+      // Storage may be unavailable (incognito mode, disabled)
+    }
   }
 
   /**
@@ -243,38 +258,59 @@
   }
 
   /**
-   * Render decrypted markdown as HTML.
-   * Uses a simple markdown-to-HTML conversion for basic formatting.
+   * Show the unlock state: render content, hide form, add lock button if credentials are saved.
+   */
+  function showUnlocked(container, plaintext) {
+    const form = container.querySelector(".cryptoid-form");
+    const contentDiv = container.querySelector(".cryptoid-content");
+    const containerId = container.id;
+
+    contentDiv.innerHTML = renderContent(plaintext);
+    contentDiv.style.display = "block";
+    form.style.display = "none";
+    container.classList.add("cryptoid-unlocked");
+
+    // Add lock button if credentials are saved
+    if (getSavedCredentials(containerId)) {
+      const lockBtn = document.createElement("button");
+      lockBtn.className = "cryptoid-lock-btn";
+      lockBtn.textContent = "Lock";
+      lockBtn.addEventListener("click", function () {
+        clearSavedCredentials(containerId);
+        contentDiv.style.display = "none";
+        contentDiv.innerHTML = "";
+        lockBtn.remove();
+        form.style.display = "";
+        container.classList.remove("cryptoid-unlocked");
+      });
+      contentDiv.parentNode.insertBefore(lockBtn, contentDiv);
+    }
+  }
+
+  /**
+   * Render decrypted markdown as HTML using marked.js.
+   * Falls back to basic escaping if marked is not loaded.
    */
   function renderContent(markdown) {
-    // Basic markdown rendering (headers, paragraphs, bold, italic, code, links)
-    let html = markdown
-      // Escape HTML first
+    if (typeof marked !== "undefined" && marked.parse) {
+      // Configure marked with link sanitization
+      const renderer = new marked.Renderer();
+      const originalLink = renderer.link.bind(renderer);
+      renderer.link = function (token) {
+        if (!isSafeUrl(token.href)) {
+          return token.text;
+        }
+        return originalLink(token);
+      };
+      return marked.parse(markdown, { renderer: renderer, breaks: false });
+    }
+    // Fallback: escape HTML and wrap in paragraph
+    return "<p>" + markdown
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      // Headers
-      .replace(/^### (.*$)/gm, "<h3>$1</h3>")
-      .replace(/^## (.*$)/gm, "<h2>$1</h2>")
-      .replace(/^# (.*$)/gm, "<h1>$1</h1>")
-      // Bold and italic
-      .replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
-      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-      .replace(/\*(.+?)\*/g, "<em>$1</em>")
-      // Inline code
-      .replace(/`([^`]+)`/g, "<code>$1</code>")
-      // Links (with URL scheme validation)
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (match, text, url) {
-        if (isSafeUrl(url)) {
-          return '<a href="' + url + '">' + text + "</a>";
-        }
-        return text;
-      })
-      // Line breaks and paragraphs
       .replace(/\n\n+/g, "</p><p>")
-      .replace(/\n/g, "<br>");
-
-    return "<p>" + html + "</p>";
+      .replace(/\n/g, "<br>") + "</p>";
   }
 
   /**
@@ -297,7 +333,7 @@
 
     const username = mode === "user" && usernameInput ? usernameInput.value : "";
     const password = passwordInput.value;
-    const ciphertext = template.textContent.trim();
+    const ciphertext = template.innerHTML.trim();
     const rememberMode = container.dataset.remember;
     const expectedHash = container.dataset.contentHash;
 
@@ -325,10 +361,8 @@
         rememberCheckbox?.checked
       );
 
-      // Render and display content
-      contentDiv.innerHTML = renderContent(plaintext);
-      contentDiv.style.display = "block";
-      form.style.display = "none";
+      // Render and display unlocked content with optional lock button
+      showUnlocked(container, plaintext);
     } catch (e) {
       // Show error — distinguish format errors from wrong credentials
       let message;
@@ -367,9 +401,7 @@
 
       if (saved) {
         const template = container.querySelector(".cryptoid-ciphertext");
-        const form = container.querySelector(".cryptoid-form");
-        const contentDiv = container.querySelector(".cryptoid-content");
-        const ciphertext = template.textContent.trim();
+        const ciphertext = template.innerHTML.trim();
         const expectedHash = container.dataset.contentHash;
 
         try {
@@ -383,10 +415,7 @@
             }
           }
 
-          // Content is safe: renderContent() escapes HTML before building markup
-          contentDiv.innerHTML = renderContent(plaintext);
-          contentDiv.style.display = "block";
-          form.style.display = "none";
+          showUnlocked(container, plaintext);
         } catch (e) {
           // Saved credentials are wrong or content corrupted, clear them
           clearSavedCredentials(containerId);

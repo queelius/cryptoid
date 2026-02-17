@@ -77,25 +77,33 @@
   {{ .Page.Scratch.Set "cryptoidIncluded" true }}
   <style>
     .cryptoid-container {
-      border: 1px solid #ddd;
+      border: 1px solid rgba(128, 128, 128, 0.3);
       border-radius: 8px;
       padding: 2rem;
       margin: 1rem 0;
-      background: #f9f9f9;
+      background: rgba(128, 128, 128, 0.06);
+    }
+    /* After unlock, strip container chrome so content looks native */
+    .cryptoid-container.cryptoid-unlocked {
+      border: none;
+      border-radius: 0;
+      padding: 0;
+      margin: 0;
+      background: none;
     }
     .cryptoid-form {
       text-align: center;
     }
     .cryptoid-lock-icon {
-      font-size: 3rem;
-      margin-bottom: 1rem;
+      font-size: 2.5rem;
+      margin-bottom: 0.75rem;
     }
     .cryptoid-message {
-      color: #666;
+      opacity: 0.7;
       margin-bottom: 0.5rem;
     }
     .cryptoid-hint {
-      color: #888;
+      opacity: 0.5;
       font-size: 0.9rem;
       font-style: italic;
       margin-bottom: 1rem;
@@ -109,10 +117,12 @@
     .cryptoid-username,
     .cryptoid-password {
       padding: 0.5rem 1rem;
-      border: 1px solid #ccc;
+      border: 1px solid rgba(128, 128, 128, 0.4);
       border-radius: 4px;
       font-size: 1rem;
       width: 200px;
+      background: rgba(128, 128, 128, 0.1);
+      color: inherit;
     }
     .cryptoid-submit {
       padding: 0.5rem 1rem;
@@ -128,7 +138,7 @@
     }
     .cryptoid-remember-label {
       display: block;
-      color: #666;
+      opacity: 0.6;
       font-size: 0.9rem;
       cursor: pointer;
     }
@@ -136,8 +146,55 @@
       color: #dc3545;
       margin-top: 1rem;
     }
+    .cryptoid-lock-btn {
+      display: inline-block;
+      padding: 0.3rem 0.75rem;
+      font-size: 0.8rem;
+      background: rgba(128, 128, 128, 0.15);
+      color: inherit;
+      border: 1px solid rgba(128, 128, 128, 0.3);
+      border-radius: 4px;
+      cursor: pointer;
+      margin-bottom: 1rem;
+      opacity: 0.7;
+    }
+    .cryptoid-lock-btn:hover {
+      opacity: 1;
+      background: rgba(128, 128, 128, 0.25);
+    }
     .cryptoid-content {
       line-height: 1.6;
+    }
+    .cryptoid-content h1,
+    .cryptoid-content h2,
+    .cryptoid-content h3 {
+      margin-top: 1.5em;
+      margin-bottom: 0.5em;
+    }
+    .cryptoid-content p {
+      margin-bottom: 1em;
+    }
+    .cryptoid-content ul,
+    .cryptoid-content ol {
+      margin-bottom: 1em;
+      padding-left: 1.5em;
+    }
+    .cryptoid-content li {
+      margin-bottom: 0.25em;
+    }
+    .cryptoid-content pre {
+      background: rgba(128, 128, 128, 0.1);
+      border-radius: 4px;
+      padding: 1em;
+      overflow-x: auto;
+      margin-bottom: 1em;
+    }
+    .cryptoid-content code {
+      font-size: 0.9em;
+    }
+    .cryptoid-content a {
+      color: #007bff;
+      text-decoration: underline;
     }
     .cryptoid-noscript {
       color: #856404;
@@ -145,29 +202,7 @@
       padding: 1rem;
       border-radius: 4px;
     }
-
-    /* Dark mode support */
-    @media (prefers-color-scheme: dark) {
-      .cryptoid-container {
-        background: #1a1a1a;
-        border-color: #333;
-      }
-      .cryptoid-message {
-        color: #aaa;
-      }
-      .cryptoid-hint {
-        color: #888;
-      }
-      .cryptoid-username,
-      .cryptoid-password {
-        background: #2a2a2a;
-        border-color: #444;
-        color: #eee;
-      }
-      .cryptoid-remember-label {
-        color: #aaa;
-      }
-    }
   </style>
+  <script src="{{ "js/marked.min.js" | relURL }}"></script>
   <script src="{{ "js/cryptoid.js" | relURL }}"></script>
 {{ end }}

@@ -507,5 +507,5 @@ class TestUnwrapKeyExceptionHandling:
         iv, ct = _wrap_key(cek, wrapping_key)
         # Truncate IV to invalid length — this should raise ValueError,
         # not be silently swallowed as None
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError):
             _unwrap_key(iv[:4], ct, wrapping_key)
