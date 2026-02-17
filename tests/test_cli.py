@@ -13,6 +13,7 @@ from cryptoid.cli import (
     _try_decrypt_any_user,
     _build_shortcode,
     _resolve_hugo_site,
+    _build_content_tree,
 )
 from cryptoid.crypto import CryptoidError, encrypt
 from cryptoid.frontmatter import is_already_encrypted
@@ -1519,3 +1520,158 @@ Some content.
 
         assert result.exit_code == 0
         assert "Updated" in result.output
+
+
+# =============================================================================
+# Content tree builder tests
+# =============================================================================
+
+
+class TestBuildContentTree:
+    """Test _build_content_tree() helper for interactive protect mode."""
+
+    def test_flat_files(self, tmp_path):
+        """Files in root content dir appear as top-level entries with type 'file'."""
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        (content_dir / "about.md").write_text("---\ntitle: About\n---\nAbout page.\n")
+        (content_dir / "contact.md").write_text("---\ntitle: Contact\n---\nContact page.\n")
+
+        result = _build_content_tree(content_dir)
+
+        labels = [e["label"] for e in result]
+        assert "about.md" in labels
+        assert "contact.md" in labels
+
+        for entry in result:
+            assert entry["type"] == "file"
+            assert entry["encrypted"] is False
+
+    def test_nested_directory(self, tmp_path):
+        """Directory with .md files appears as dir entry followed by indented file entries."""
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        blog_dir = content_dir / "blog"
+        blog_dir.mkdir()
+        (blog_dir / "_index.md").write_text("---\ntitle: Blog\n---\n")
+        (blog_dir / "post1.md").write_text("---\ntitle: Post 1\n---\nContent.\n")
+        (blog_dir / "post2.md").write_text("---\ntitle: Post 2\n---\nContent.\n")
+
+        result = _build_content_tree(content_dir)
+
+        # First entry should be the directory
+        assert result[0]["label"] == "blog/"
+        assert result[0]["type"] == "dir"
+        assert result[0]["path"] == blog_dir
+
+        # Subsequent entries should be indented files with tree connectors
+        file_entries = [e for e in result if e["type"] == "file"]
+        assert len(file_entries) == 2
+
+        # Last file gets └── connector, others get ├──
+        assert "\u251c\u2500\u2500" in file_entries[0]["label"]  # ├──
+        assert "\u2514\u2500\u2500" in file_entries[1]["label"]  # └──
+
+    def test_index_md_excluded(self, tmp_path):
+        """_index.md files are not listed individually."""
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        section_dir = content_dir / "section"
+        section_dir.mkdir()
+        (section_dir / "_index.md").write_text("---\ntitle: Section\n---\n")
+        (section_dir / "page.md").write_text("---\ntitle: Page\n---\nContent.\n")
+
+        result = _build_content_tree(content_dir)
+
+        labels = [e["label"] for e in result]
+        # _index.md should not appear as its own entry
+        for label in labels:
+            assert "_index.md" not in label
+
+    def test_encryption_status_detected(self, tmp_path):
+        """Files with encrypted: true in front matter have encrypted=True."""
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        (content_dir / "public.md").write_text("---\ntitle: Public\n---\nPublic.\n")
+        (content_dir / "secret.md").write_text(
+            '---\ntitle: Secret\nencrypted: true\ngroups: ["team"]\n---\nSecret.\n'
+        )
+
+        result = _build_content_tree(content_dir)
+
+        by_path = {str(e["path"].name): e for e in result}
+        assert by_path["public.md"]["encrypted"] is False
+        assert by_path["secret.md"]["encrypted"] is True
+
+    def test_cascade_detected(self, tmp_path):
+        """Files in encrypted directory detected via _index.md cascade."""
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        private_dir = content_dir / "private"
+        private_dir.mkdir()
+        (private_dir / "_index.md").write_text(
+            '---\ntitle: Private\nencrypted: true\ngroups: ["admin"]\n---\n'
+        )
+        (private_dir / "secret.md").write_text(
+            "---\ntitle: Secret Page\n---\nInherited encryption.\n"
+        )
+
+        result = _build_content_tree(content_dir)
+
+        # The directory entry should show encrypted
+        dir_entry = [e for e in result if e["type"] == "dir"][0]
+        assert dir_entry["encrypted"] is True
+
+        # The file inside should also be encrypted (via cascade)
+        file_entry = [e for e in result if e["type"] == "file"][0]
+        assert file_entry["encrypted"] is True
+
+    def test_non_md_files_excluded(self, tmp_path):
+        """Non-.md files like .png are not included."""
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        (content_dir / "page.md").write_text("---\ntitle: Page\n---\nContent.\n")
+        (content_dir / "image.png").write_bytes(b"\x89PNG\r\n")
+        (content_dir / "data.json").write_text("{}")
+
+        result = _build_content_tree(content_dir)
+
+        paths = [str(e["path"].name) for e in result]
+        assert "page.md" in paths
+        assert "image.png" not in paths
+        assert "data.json" not in paths
+
+    def test_empty_dir_excluded(self, tmp_path):
+        """Directories with no .md files are not shown."""
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        # Directory with only non-md files
+        assets_dir = content_dir / "assets"
+        assets_dir.mkdir()
+        (assets_dir / "style.css").write_text("body {}")
+
+        # Directory with only _index.md (no other .md files)
+        empty_section = content_dir / "empty"
+        empty_section.mkdir()
+        (empty_section / "_index.md").write_text("---\ntitle: Empty\n---\n")
+
+        # Directory that is truly empty
+        bare_dir = content_dir / "bare"
+        bare_dir.mkdir()
+
+        (content_dir / "page.md").write_text("---\ntitle: Page\n---\nContent.\n")
+
+        result = _build_content_tree(content_dir)
+
+        labels = [e["label"] for e in result]
+        assert "assets/" not in labels
+        assert "empty/" not in labels
+        assert "bare/" not in labels
+        assert "page.md" in labels

@@ -380,6 +380,95 @@ def resolve_encryption(file_path: Path, content_dir: Path) -> EncryptionConfig |
     return None
 
 
+def _build_content_tree(content_dir: Path) -> list[dict[str, Any]]:
+    """Walk content_dir recursively and build a flat list of entries for display.
+
+    Each entry is a dict with:
+        - label: Display string with tree connectors for nested files.
+        - path: Path to the file or directory.
+        - type: "dir" or "file".
+        - encrypted: bool — current encryption status.
+
+    Rules:
+        - _index.md files are not listed individually (represented by dir entry).
+        - Non-.md files are excluded.
+        - Directories with no .md files (other than _index.md) are excluded.
+        - Directories are sorted alphabetically, files alphabetically within each dir.
+        - Root-level files appear without tree connectors.
+
+    Args:
+        content_dir: Root content directory to scan.
+
+    Returns:
+        Flat list of entry dicts suitable for interactive selection.
+    """
+    from collections import defaultdict
+
+    entries: list[dict[str, Any]] = []
+
+    # Collect all .md files grouped by their parent directory
+    dir_files: dict[Path, list[Path]] = defaultdict(list)
+
+    for md_file in sorted(content_dir.rglob("*.md")):
+        if md_file.name == "_index.md":
+            continue
+        dir_files[md_file.parent].append(md_file)
+
+    # Separate root-level files from subdirectory files
+    root_files = sorted(dir_files.pop(content_dir, []), key=lambda p: p.name)
+    subdirs = sorted(dir_files.keys(), key=lambda p: p.relative_to(content_dir))
+
+    # Add root-level files (no tree connectors)
+    for f in root_files:
+        enc_config = resolve_encryption(f, content_dir)
+        entries.append({
+            "label": f.name,
+            "path": f,
+            "type": "file",
+            "encrypted": enc_config is not None and enc_config.encrypted,
+        })
+
+    # Add subdirectory entries
+    for dir_path in subdirs:
+        files = sorted(dir_files[dir_path], key=lambda p: p.name)
+        if not files:
+            continue
+
+        # Check directory encryption via _index.md
+        index_file = dir_path / "_index.md"
+        dir_encrypted = False
+        if index_file.exists():
+            try:
+                index_content = index_file.read_text(encoding="utf-8")
+                fm, _ = parse_markdown(index_content)
+                dir_encrypted = fm.get("encrypted", False) is True
+            except (OSError, ValueError):
+                pass
+
+        rel = dir_path.relative_to(content_dir)
+        entries.append({
+            "label": f"{rel}/",
+            "path": dir_path,
+            "type": "dir",
+            "encrypted": dir_encrypted,
+        })
+
+        # Add files with tree connectors
+        for i, f in enumerate(files):
+            is_last = i == len(files) - 1
+            connector = "\u2514\u2500\u2500" if is_last else "\u251c\u2500\u2500"
+            enc_config = resolve_encryption(f, content_dir)
+
+            entries.append({
+                "label": f"  {connector} {f.name}",
+                "path": f,
+                "type": "file",
+                "encrypted": enc_config is not None and enc_config.encrypted,
+            })
+
+    return entries
+
+
 def resolve_users(
     groups_list: list[str] | None,
     config: dict[str, Any],
