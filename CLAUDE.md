@@ -33,9 +33,9 @@ cryptoid decrypt --content-dir content/ --config .cryptoid.yaml
 cryptoid status  --content-dir content/ --config .cryptoid.yaml [--verbose]
 cryptoid rewrap  --content-dir content/ --config .cryptoid.yaml [--rekey]
 cryptoid protect  content/private/ --groups team [--hint "..."] [--remember ask]
+cryptoid protect  -i [--config .cryptoid.yaml]                       # interactive Textual TUI
 cryptoid unprotect content/private/
 cryptoid hugo status|install|uninstall
-cryptoid claude status|install|uninstall
 ```
 
 ## Architecture
@@ -58,7 +58,8 @@ The Python (`src/cryptoid/crypto.py`) and JavaScript (`hugo/assets/js/cryptoid.j
 
 - **`src/cryptoid/crypto.py`** — v2 encryption/decryption with multi-user key wrapping, CEK management, PBKDF2 key derivation, `rewrap_keys()` for user set changes, content hashing. Custom `CryptoidError` exception for all crypto failures.
 - **`src/cryptoid/frontmatter.py`** — Parses markdown front matter to extract `EncryptionConfig` dataclass (encrypted, groups, password_hint, remember). Detects whether a file should be encrypted or is already encrypted (via shortcode regex).
-- **`src/cryptoid/cli.py`** — Click CLI with commands: `encrypt`, `decrypt`, `status`, `rewrap`, `hugo` (status/install/uninstall), `claude` (status/install/uninstall). Handles config loading from `.cryptoid.yaml` (users/groups/salt), `_index.md` cascade resolution, group-to-user resolution with admin injection, and file processing logic.
+- **`src/cryptoid/cli.py`**: Click CLI with commands `init`, `config` (status, show, validate, init-global, list-users, add-user, remove-user, list-groups, add-group, remove-group, add-to-group, remove-from-group, generate-salt), `encrypt`, `decrypt`, `status`, `rewrap`, `protect` (supports `-i`/`--interactive` Textual TUI), `unprotect`, `hugo` (status, install, uninstall). Handles config loading from `.cryptoid.yaml` (users, groups, salt), `_index.md` cascade resolution, group-to-user resolution with admin injection, and file processing logic.
+- **`src/cryptoid/tui.py`**: Textual-based interactive tree view (`ProtectApp`) for `cryptoid protect -i`. Lets the user browse the content tree and toggle encryption on files and directories with cascade-aware display state.
 - **`hugo/layouts/shortcodes/cryptoid-encrypted.html`** — Hugo shortcode with `mode="user"` parameter, renders username+password form, embeds ciphertext.
 - **`hugo/assets/js/cryptoid.js`** — Browser-side v2 decryption (key blob iteration, CEK unwrapping), credential storage (JSON `{u,p}` in localStorage/sessionStorage), and basic markdown rendering.
 
@@ -81,7 +82,7 @@ Encryption settings propagate from `_index.md` files to all content in that dire
 3. First `_index.md` with `encrypted` field wins (nearest override)
 4. Nothing found → not encrypted
 
-Rules: `_index.md` files themselves are never encrypted. `encrypted: false` overrides any inherited `true`. A file's `groups` fully replaces inherited groups (no merging).
+Rules: `_index.md` bodies are encrypted like any other file (front matter stays readable for cascade resolution). For cascade inheritance, `_index.md` skips its own directory and starts walking from the parent. `encrypted: false` overrides any inherited `true`. A file's `groups` fully replaces inherited groups (no merging).
 
 ### Configuration
 

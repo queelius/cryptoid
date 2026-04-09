@@ -12,7 +12,7 @@ from typing import Any
 import click
 import yaml
 import frontmatter
-from simple_term_menu import TerminalMenu
+from .tui import ProtectApp
 
 from .crypto import (
     encrypt,
@@ -85,7 +85,7 @@ def _load_global_config() -> dict[str, Any]:
     return config
 
 
-def load_config(config_path: Path) -> dict[str, Any]:
+def load_config(config_path: Path | None = None) -> dict[str, Any]:
     """Load cryptoid configuration, merging global and local configs.
 
     Merge semantics:
@@ -99,7 +99,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
     config (users + content_dir + groups, no salt).
 
     Args:
-        config_path: Path to local .cryptoid.yaml
+        config_path: Path to local .cryptoid.yaml (defaults to .cryptoid.yaml)
 
     Returns:
         Validated configuration dictionary.
@@ -108,6 +108,9 @@ def load_config(config_path: Path) -> dict[str, Any]:
         FileNotFoundError: If neither local nor global config exists.
         CryptoidError: If merged config is invalid.
     """
+    if config_path is None:
+        config_path = Path(".cryptoid.yaml")
+
     global_config = _load_global_config()
 
     if config_path.exists():
@@ -317,6 +320,50 @@ def _resolve_content_dir(
 # =============================================================================
 
 
+def _walk_cascade_from(
+    start_dir: Path, content_dir: Path
+) -> EncryptionConfig | None:
+    """Walk up from start_dir to content_dir, returning nearest _index.md cascade.
+
+    Starts at start_dir itself (checks start_dir/_index.md first), then walks
+    upward. Returns the first EncryptionConfig found via an _index.md's
+    'encrypted: true' field, or None if an 'encrypted: false' is found first,
+    or if no 'encrypted' field is found before reaching content_dir.
+
+    Used by both resolve_encryption() (for files, after checking own front
+    matter) and _build_content_tree() (for directory cascade state).
+
+    Args:
+        start_dir: Directory to begin the walk at.
+        content_dir: Root content directory (walk stops here).
+
+    Returns:
+        EncryptionConfig if cascade applies, None otherwise.
+    """
+    try:
+        start_dir.relative_to(content_dir)
+    except ValueError:
+        return None
+
+    current = start_dir
+    while True:
+        index_file = current / "_index.md"
+        if index_file.exists():
+            index_content = index_file.read_text(encoding="utf-8")
+            index_fm, _ = parse_markdown(index_content)
+            if "encrypted" in index_fm:
+                if index_fm["encrypted"] is False:
+                    return None
+                if index_fm["encrypted"] is True:
+                    return get_encryption_config(index_content)
+        if current == content_dir:
+            return None
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
 def resolve_encryption(file_path: Path, content_dir: Path) -> EncryptionConfig | None:
     """Resolve effective encryption config for a file using _index.md cascade.
 
@@ -326,7 +373,8 @@ def resolve_encryption(file_path: Path, content_dir: Path) -> EncryptionConfig |
         3. First _index.md with 'encrypted' field → use it (nearest wins)
         4. Nothing found → None (not encrypted)
 
-    _index.md files themselves are never encrypted.
+    For _index.md files: step 1 checks own front matter as usual, but step 2
+    starts from the parent directory (skips its own dir to avoid self-cascade).
 
     Args:
         file_path: Path to the markdown file.
@@ -335,10 +383,6 @@ def resolve_encryption(file_path: Path, content_dir: Path) -> EncryptionConfig |
     Returns:
         EncryptionConfig if encryption applies, None if not.
     """
-    # _index.md files are never encrypted
-    if file_path.name == "_index.md":
-        return None
-
     content = file_path.read_text(encoding="utf-8")
     fm, _ = parse_markdown(content)
 
@@ -350,35 +394,14 @@ def resolve_encryption(file_path: Path, content_dir: Path) -> EncryptionConfig |
             return get_encryption_config(content)
 
     # Walk up parent directories
-    try:
-        rel = file_path.parent.relative_to(content_dir)
-    except ValueError:
-        return None
+    # For _index.md: start from parent dir (skip own dir to avoid self-cascade)
+    # For regular files: start from own dir
+    if file_path.name == "_index.md":
+        start_dir = file_path.parent.parent
+    else:
+        start_dir = file_path.parent
 
-    # Build list of directories from file's parent up to content_dir
-    dirs_to_check = []
-    current = file_path.parent
-    while True:
-        dirs_to_check.append(current)
-        if current == content_dir:
-            break
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
-
-    for dir_path in dirs_to_check:
-        index_file = dir_path / "_index.md"
-        if index_file.exists():
-            index_content = index_file.read_text(encoding="utf-8")
-            index_fm, _ = parse_markdown(index_content)
-            if "encrypted" in index_fm:
-                if index_fm["encrypted"] is False:
-                    return None
-                if index_fm["encrypted"] is True:
-                    return get_encryption_config(index_content)
-
-    return None
+    return _walk_cascade_from(start_dir, content_dir)
 
 
 def _build_content_tree(content_dir: Path) -> list[dict[str, Any]]:
@@ -388,13 +411,23 @@ def _build_content_tree(content_dir: Path) -> list[dict[str, Any]]:
         - label: Display string with tree connectors for nested files.
         - path: Path to the file or directory.
         - type: "dir" or "file".
-        - encrypted: bool — current encryption status.
+        - encrypted: bool — current effective encryption status (cascade-aware).
 
     Rules:
-        - _index.md files are not listed individually (represented by dir entry).
+        - _index.md files are NOT listed as file entries; they are represented
+          by their containing directory entry (toggling the dir == toggling the
+          _index.md's cascade AND body, which are the same file under the new
+          v2 semantics).
         - Non-.md files are excluded.
-        - Directories with no .md files (other than _index.md) are excluded.
-        - Directories are sorted alphabetically, files alphabetically within each dir.
+        - All directories containing any .md file (directly or transitively)
+          are emitted, including intermediate directories with no .md files
+          of their own. Emitting intermediates ensures the TUI's tree-builder
+          never has to synthesize ancestor nodes with a default encrypted state.
+        - Every entry's encrypted state is computed via the full cascade walk
+          (resolve_encryption for files, _walk_cascade_from for dirs), so the
+          TUI checkbox state matches what 'cryptoid encrypt' would actually do.
+        - Directories are sorted alphabetically by their relative path; files
+          within each directory are sorted alphabetically.
         - Root-level files appear without tree connectors.
 
     Args:
@@ -407,44 +440,55 @@ def _build_content_tree(content_dir: Path) -> list[dict[str, Any]]:
 
     entries: list[dict[str, Any]] = []
 
-    # Collect all .md files grouped by their parent directory
+    # Collect all regular .md files grouped by their parent directory.
+    # _index.md files are skipped — they are represented by the directory entry.
+    # Use setdefault so a dir with only _index.md still appears as a key.
     dir_files: dict[Path, list[Path]] = defaultdict(list)
 
     for md_file in sorted(content_dir.rglob("*.md")):
         if md_file.name == "_index.md":
+            # Ensure the directory is tracked even if it has no other .md files
+            if md_file.parent != content_dir:
+                dir_files.setdefault(md_file.parent, [])
             continue
         dir_files[md_file.parent].append(md_file)
 
-    # Separate root-level files from subdirectory files
-    root_files = sorted(dir_files.pop(content_dir, []), key=lambda p: p.name)
-    subdirs = sorted(dir_files.keys(), key=lambda p: p.relative_to(content_dir))
+    # Expand to include all intermediate directories on the path from
+    # content_dir down to every directory in dir_files. This prevents the
+    # TUI from having to synthesize ancestor nodes with unknown cascade state.
+    all_dirs: set[Path] = set(dir_files.keys())
+    all_dirs.discard(content_dir)
+    for leaf in list(all_dirs):
+        current = leaf.parent
+        while current != content_dir and current != current.parent:
+            try:
+                current.relative_to(content_dir)
+            except ValueError:
+                break
+            all_dirs.add(current)
+            current = current.parent
 
-    # Add root-level files (no tree connectors)
+    # Root-level regular files (no tree connectors)
+    root_files = sorted(dir_files.pop(content_dir, []), key=lambda p: p.name)
     for f in root_files:
         enc_config = resolve_encryption(f, content_dir)
         entries.append({
             "label": f.name,
             "path": f,
             "type": "file",
-            "encrypted": enc_config is not None and enc_config.encrypted,
+            "encrypted": enc_config is not None,
         })
 
-    # Add subdirectory entries
-    for dir_path in subdirs:
-        files = sorted(dir_files[dir_path], key=lambda p: p.name)
-        if not files:
-            continue
+    # Sort directories by their relative path so ancestors precede descendants
+    sorted_dirs = sorted(all_dirs, key=lambda p: p.relative_to(content_dir).parts)
 
-        # Check directory encryption via _index.md
-        index_file = dir_path / "_index.md"
-        dir_encrypted = False
-        if index_file.exists():
-            try:
-                index_content = index_file.read_text(encoding="utf-8")
-                fm, _ = parse_markdown(index_content)
-                dir_encrypted = fm.get("encrypted", False) is True
-            except (OSError, ValueError):
-                pass
+    for dir_path in sorted_dirs:
+        files = sorted(dir_files.get(dir_path, []), key=lambda p: p.name)
+
+        # Cascade-aware directory state: walk from dir_path up through
+        # its own _index.md (if any) then ancestors. This matches how files
+        # inside the dir resolve their encryption.
+        dir_encrypted = _walk_cascade_from(dir_path, content_dir) is not None
 
         rel = dir_path.relative_to(content_dir)
         entries.append({
@@ -464,7 +508,7 @@ def _build_content_tree(content_dir: Path) -> list[dict[str, Any]]:
                 "label": f"  {connector} {f.name}",
                 "path": f,
                 "type": "file",
-                "encrypted": enc_config is not None and enc_config.encrypted,
+                "encrypted": enc_config is not None,
             })
 
     return entries
@@ -972,8 +1016,6 @@ def config_validate(content_dir: Path | None, config_path: Path):
     cascade_errors = 0
 
     for md_file in sorted(content_dir.rglob("*.md")):
-        if md_file.name == "_index.md":
-            continue
         rel = md_file.relative_to(content_dir)
 
         enc_config = resolve_encryption(md_file, content_dir)
@@ -2044,10 +2086,6 @@ def encrypt_cmd(content_dir: Path | None, config_path: Path, dry_run: bool):
 
     # Find all markdown files
     for md_file in sorted(content_dir.rglob("*.md")):
-        # Skip _index.md files
-        if md_file.name == "_index.md":
-            continue
-
         # Resolve encryption via cascade
         enc_config = resolve_encryption(md_file, content_dir)
         if enc_config is None:
@@ -2242,21 +2280,24 @@ def status(content_dir: Path | None, config_path: Path, verbose: bool):
     for md_file in sorted(content_dir.rglob("*.md")):
         rel = md_file.relative_to(content_dir)
 
-        if md_file.name == "_index.md":
-            # Show _index.md cascade settings
-            content = md_file.read_text(encoding="utf-8")
-            fm, _ = parse_markdown(content)
-            if "encrypted" in fm:
-                enc_config = get_encryption_config(content)
-                groups_info = enc_config.groups or ["all"]
-                click.echo(f"  [cascade]   {rel}  groups={groups_info}")
-            continue
-
         enc_config = resolve_encryption(md_file, content_dir)
         content = md_file.read_text(encoding="utf-8")
         already_enc = is_already_encrypted(content)
 
         if enc_config is None:
+            if md_file.name == "_index.md":
+                # _index.md whose own front matter declares `encrypted: false`
+                # still surfaces its cascade intent for the status listing.
+                # (If its own field is `encrypted: true`, resolve_encryption
+                # would have returned non-None and we'd be in the `else` branch
+                # below labeled as `cascade-source` — both body-encrypted AND
+                # cascade-setting. This branch only fires for explicit opt-out.)
+                fm, _ = parse_markdown(content)
+                if "encrypted" in fm:
+                    idx_config = get_encryption_config(content)
+                    groups_info = idx_config.groups or ["all"]
+                    click.echo(f"  [cascade]   {rel}  groups={groups_info}")
+                    continue
             plain_files.append(str(rel))
             click.echo(f"  [plain]     {rel}")
         else:
@@ -2265,6 +2306,10 @@ def status(content_dir: Path | None, config_path: Path, verbose: bool):
             source = "own" if "encrypted" in fm else "inherited"
             groups_info = enc_config.groups or ["all"]
             state = "ENCRYPTED" if already_enc else "pending"
+
+            # _index.md that declares encryption is both cascade source and encrypted
+            if md_file.name == "_index.md" and source == "own":
+                source = "cascade-source"
 
             try:
                 users = resolve_users(enc_config.groups, config)
@@ -2417,6 +2462,33 @@ def rewrap(content_dir: Path | None, config_path: Path, rekey: bool):
 # =============================================================================
 
 
+def _tui_unprotect_directory(dir_path: Path) -> None:
+    """Unprotect a directory from the TUI, handling the cascade-inherited case.
+
+    If the directory has its own `_index.md`, delegate to `_unprotect_directory`
+    which clears its encryption fields.
+
+    If the directory has no `_index.md`, it is being unprotected because the
+    TUI showed it as encrypted via inherited cascade from a parent. In that
+    case, create a minimal `_index.md` with `encrypted: false` so the directory
+    explicitly opts out of the inherited cascade. Without this, the user's
+    uncheck in the TUI would silently have no effect.
+    """
+    index_path = dir_path / "_index.md"
+    if index_path.exists():
+        _unprotect_directory(dir_path)
+        return
+
+    post = frontmatter.Post("")
+    post.metadata["title"] = (
+        dir_path.name.replace("-", " ").replace("_", " ").title()
+    )
+    post.metadata["encrypted"] = False
+    index_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    click.echo(f"Created {index_path}")
+    click.echo("  encrypted: false (explicit opt-out from inherited cascade)")
+
+
 def _interactive_protect(
     config: dict[str, Any],
     groups: tuple[str, ...],
@@ -2424,69 +2496,56 @@ def _interactive_protect(
     remember: str | None,
 ) -> None:
     """Browse content tree and interactively select items to protect/unprotect."""
-    content_dir = _resolve_content_dir(None, config)
+    try:
+        content_dir = _resolve_content_dir(None, config)
+    except SystemExit:
+        # _resolve_content_dir calls sys.exit(1) if no content_dir could be
+        # resolved. Re-emit a clearer message pointing at the interactive flow.
+        click.echo(
+            "Error: cannot run 'cryptoid protect -i' without a content "
+            "directory.\n"
+            "  Set CRYPTOID_CONTENT_DIR, pass --content-dir, or add "
+            "'content_dir' to your .cryptoid.yaml.",
+            err=True,
+        )
+        sys.exit(1)
+
     entries = _build_content_tree(content_dir)
 
     if not entries:
         click.echo("No content files found.")
         return
 
-    menu_labels = [e["label"] for e in entries]
-    preselected = [i for i, e in enumerate(entries) if e["encrypted"]]
+    app = ProtectApp(entries, content_dir=content_dir)
+    changes = app.run()
 
-    menu = TerminalMenu(
-        menu_labels,
-        multi_select=True,
-        show_multi_select_hint=True,
-        preselected_entries=preselected,
-        title="  Select content to protect/unprotect\n",
-        multi_select_cursor="[x] ",
-        multi_select_select_on_accept=False,
-        multi_select_empty_ok=True,
-    )
-
-    selected = menu.show()
-
-    if selected is None:
-        click.echo("Cancelled.")
-        return
-
-    selected_set = set(selected)
-    preselected_set = set(preselected)
-
-    to_protect = selected_set - preselected_set
-    to_unprotect = preselected_set - selected_set
-
-    if not to_protect and not to_unprotect:
+    if not changes:
         click.echo("No changes.")
         return
 
     # Print summary
-    for idx in sorted(to_protect):
-        click.echo(f"  + protect: {entries[idx]['label'].strip()}")
-    for idx in sorted(to_unprotect):
-        click.echo(f"  - unprotect: {entries[idx]['label'].strip()}")
+    for change in changes:
+        action = change["action"]
+        name = change["path"].name
+        if change["type"] == "dir":
+            name += "/"
+        symbol = "+" if action == "protect" else "-"
+        click.echo(f"  {symbol} {action}: {name}")
 
-    total = len(to_protect) + len(to_unprotect)
-    if not click.confirm(f"Apply {total} changes?"):
-        click.echo("Cancelled.")
-        return
+    click.echo()
 
-    # Apply protections
-    for idx in sorted(to_protect):
-        entry = entries[idx]
-        if entry["type"] == "dir":
-            _protect_directory(entry["path"], groups, hint, remember)
+    # Apply changes
+    for change in changes:
+        if change["action"] == "protect":
+            if change["type"] == "dir":
+                _protect_directory(change["path"], groups, hint, remember)
+            else:
+                _protect_file(change["path"], groups, hint, remember)
         else:
-            _protect_file(entry["path"], groups, hint, remember)
-
-    # Apply unprotections
-    for idx in sorted(to_unprotect):
-        entry = entries[idx]
-        if entry["type"] == "dir":
-            _unprotect_directory(entry["path"])
-        else:
-            _unprotect_file(entry["path"])
+            if change["type"] == "dir":
+                _tui_unprotect_directory(change["path"])
+            else:
+                _unprotect_file(change["path"])
 
 
 @main.command()
@@ -2499,7 +2558,7 @@ def _interactive_protect(
 @click.option(
     "--config", "config_path",
     type=click.Path(path_type=Path),
-    default=None,
+    default=".cryptoid.yaml",
     help="Path to .cryptoid.yaml config file",
 )
 @click.option(
@@ -2546,7 +2605,12 @@ def protect(
         cryptoid protect -i --config .cryptoid.yaml
     """
     if interactive:
-        config = load_config(config_path)
+        try:
+            config = load_config(config_path)
+        except (FileNotFoundError, CryptoidError):
+            # protect -i only needs content_dir, not users/salt;
+            # _resolve_content_dir will try env vars too
+            config = {}
         _interactive_protect(config, groups, hint, remember)
         return
 
@@ -2911,113 +2975,3 @@ def hugo_uninstall(site_dir: Path | None):
         click.echo("Nothing to uninstall (cryptoid was not installed)")
 
 
-# =============================================================================
-# Claude Code skill management commands
-# =============================================================================
-
-# Path to bundled Claude skill (relative to this module)
-CLAUDE_SKILL_DIR = Path(__file__).parent.parent.parent / "claude" / "skills" / "cryptoid"
-
-# Skill file name
-SKILL_FILENAME = "SKILL.md"
-
-
-def _get_local_skill_path() -> Path:
-    """Get path to local (project-specific) skill installation."""
-    return Path.cwd() / ".claude" / "skills" / "cryptoid" / SKILL_FILENAME
-
-
-def _get_global_skill_path() -> Path:
-    """Get path to global (user-wide) skill installation."""
-    return Path.home() / ".claude" / "skills" / "cryptoid" / SKILL_FILENAME
-
-
-def _get_source_skill_path() -> Path:
-    """Get path to bundled skill file."""
-    return CLAUDE_SKILL_DIR / SKILL_FILENAME
-
-
-@main.group()
-def claude():
-    """Manage Claude Code skill integration."""
-    pass
-
-
-@claude.command("status")
-def claude_status():
-    """Check cryptoid skill installation status."""
-    local_path = _get_local_skill_path()
-    global_path = _get_global_skill_path()
-
-    click.echo("Claude Code skill status:")
-    click.echo()
-
-    if local_path.exists():
-        click.echo(f"  [installed] local:  {local_path}")
-    else:
-        click.echo(f"  [missing]   local:  {local_path}")
-
-    if global_path.exists():
-        click.echo(f"  [installed] global: {global_path}")
-    else:
-        click.echo(f"  [missing]   global: {global_path}")
-
-    click.echo()
-
-    if local_path.exists() or global_path.exists():
-        click.echo("Status: cryptoid skill is installed")
-    else:
-        click.echo("Status: cryptoid skill is not installed (run 'cryptoid claude install')")
-
-
-@claude.command("install")
-@click.option(
-    "--local/--global",
-    "local",
-    default=True,
-    help="Install locally (project) or globally (user-wide)",
-)
-def claude_install(local: bool):
-    """Install cryptoid skill for Claude Code."""
-    source_path = _get_source_skill_path()
-    dest_path = _get_local_skill_path() if local else _get_global_skill_path()
-    scope = "local" if local else "global"
-
-    if not source_path.exists():
-        click.echo(f"Error: Source skill file not found: {source_path}", err=True)
-        sys.exit(1)
-
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    dest_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
-
-    click.echo(f"Installed cryptoid skill ({scope}):")
-    click.echo(f"  {dest_path}")
-
-
-@claude.command("uninstall")
-@click.option(
-    "--local/--global",
-    "local",
-    default=True,
-    help="Uninstall from local (project) or global (user-wide)",
-)
-def claude_uninstall(local: bool):
-    """Remove cryptoid skill from Claude Code."""
-    skill_path = _get_local_skill_path() if local else _get_global_skill_path()
-    scope = "local" if local else "global"
-
-    if not skill_path.exists():
-        click.echo(f"Cryptoid skill is not installed ({scope})")
-        return
-
-    skill_path.unlink()
-
-    skill_dir = skill_path.parent
-    try:
-        skill_dir.rmdir()
-        skill_dir.parent.rmdir()
-    except OSError:
-        pass
-
-    click.echo(f"Uninstalled cryptoid skill ({scope}):")
-    click.echo(f"  {skill_path}")

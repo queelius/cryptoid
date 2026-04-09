@@ -19,7 +19,7 @@ from cryptoid.cli import (
     _build_content_tree,
 )
 from cryptoid.crypto import CryptoidError, encrypt
-from cryptoid.frontmatter import is_already_encrypted
+from cryptoid.frontmatter import is_already_encrypted, parse_markdown
 
 
 @pytest.fixture
@@ -209,11 +209,44 @@ class TestResolveEncryption:
         )
         assert config is None
 
-    def test_index_md_never_encrypted(self, temp_content_dir):
-        """_index.md files themselves are never encrypted."""
+    def test_index_md_with_own_encrypted_field(self, temp_content_dir):
+        """_index.md with encrypted: true uses its own front matter."""
         config = resolve_encryption(
             temp_content_dir / "private" / "_index.md", temp_content_dir
         )
+        assert config is not None
+        assert config.encrypted is True
+
+    def test_index_md_inherits_from_parent(self, tmp_path):
+        """_index.md without own encrypted field inherits from parent _index.md."""
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        parent = content_dir / "medical"
+        parent.mkdir()
+        (parent / "_index.md").write_text(
+            '---\ntitle: Medical\nencrypted: true\ngroups: ["team"]\n---\n'
+        )
+
+        child = parent / "labs"
+        child.mkdir()
+        (child / "_index.md").write_text("---\ntitle: Labs\n---\n")
+
+        config = resolve_encryption(child / "_index.md", content_dir)
+        assert config is not None
+        assert config.encrypted is True
+        assert config.groups == ["team"]
+
+    def test_index_md_no_self_cascade(self, tmp_path):
+        """_index.md without encrypted field at top level is not encrypted."""
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        section = content_dir / "blog"
+        section.mkdir()
+        (section / "_index.md").write_text("---\ntitle: Blog\n---\n")
+
+        config = resolve_encryption(section / "_index.md", content_dir)
         assert config is None
 
     def test_nested_cascade(self, tmp_path):
@@ -684,7 +717,8 @@ class TestCascadeEncryption:
         assert not is_already_encrypted(optout)
         assert "This stays plain" in optout
 
-    def test_index_md_not_encrypted(self, runner, temp_content_dir, temp_config):
+    def test_index_md_body_encrypted(self, runner, temp_content_dir, temp_config):
+        """_index.md with encrypted: true has its body encrypted."""
         result = runner.invoke(main, [
             "encrypt",
             "--content-dir", str(temp_content_dir),
@@ -693,7 +727,10 @@ class TestCascadeEncryption:
         assert result.exit_code == 0
 
         index = (temp_content_dir / "private" / "_index.md").read_text()
-        assert not is_already_encrypted(index)
+        assert is_already_encrypted(index)
+        # Front matter should still be readable
+        fm, _ = parse_markdown(index)
+        assert fm["encrypted"] is True
 
 
 # =============================================================================
@@ -1552,7 +1589,11 @@ class TestBuildContentTree:
             assert entry["encrypted"] is False
 
     def test_nested_directory(self, tmp_path):
-        """Directory with .md files appears as dir entry followed by indented file entries."""
+        """Directory with .md files appears as dir entry followed by indented file entries.
+
+        _index.md is NOT listed as a file entry — the directory entry itself
+        represents it (toggling the dir == toggling the _index.md cascade).
+        """
         content_dir = tmp_path / "content"
         content_dir.mkdir()
 
@@ -1569,30 +1610,42 @@ class TestBuildContentTree:
         assert result[0]["type"] == "dir"
         assert result[0]["path"] == blog_dir
 
-        # Subsequent entries should be indented files with tree connectors
+        # File entries are post1.md and post2.md only (no _index.md)
         file_entries = [e for e in result if e["type"] == "file"]
         assert len(file_entries) == 2
+        file_names = [e["path"].name for e in file_entries]
+        assert "_index.md" not in file_names
+        assert "post1.md" in file_names
+        assert "post2.md" in file_names
 
         # Last file gets └── connector, others get ├──
         assert "\u251c\u2500\u2500" in file_entries[0]["label"]  # ├──
-        assert "\u2514\u2500\u2500" in file_entries[1]["label"]  # └──
+        assert "\u2514\u2500\u2500" in file_entries[-1]["label"]  # └──
 
-    def test_index_md_excluded(self, tmp_path):
-        """_index.md files are not listed individually."""
+    def test_index_md_not_duplicated_as_file(self, tmp_path):
+        """_index.md is represented by its containing directory entry, not as a
+        separate file entry. Otherwise the TUI would show the same _index.md twice."""
         content_dir = tmp_path / "content"
         content_dir.mkdir()
 
         section_dir = content_dir / "section"
         section_dir.mkdir()
-        (section_dir / "_index.md").write_text("---\ntitle: Section\n---\n")
+        (section_dir / "_index.md").write_text(
+            '---\ntitle: Section\nencrypted: true\n---\n'
+        )
         (section_dir / "page.md").write_text("---\ntitle: Page\n---\nContent.\n")
 
         result = _build_content_tree(content_dir)
 
-        labels = [e["label"] for e in result]
-        # _index.md should not appear as its own entry
-        for label in labels:
-            assert "_index.md" not in label
+        # The directory entry represents the _index.md
+        dir_entries = [e for e in result if e["type"] == "dir"]
+        assert len(dir_entries) == 1
+        assert dir_entries[0]["label"] == "section/"
+
+        # _index.md must NOT appear as a file entry
+        file_names = [e["path"].name for e in result if e["type"] == "file"]
+        assert "_index.md" not in file_names
+        assert "page.md" in file_names
 
     def test_encryption_status_detected(self, tmp_path):
         """Files with encrypted: true in front matter have encrypted=True."""
@@ -1660,10 +1713,10 @@ class TestBuildContentTree:
         assets_dir.mkdir()
         (assets_dir / "style.css").write_text("body {}")
 
-        # Directory with only _index.md (no other .md files)
-        empty_section = content_dir / "empty"
-        empty_section.mkdir()
-        (empty_section / "_index.md").write_text("---\ntitle: Empty\n---\n")
+        # Directory with only _index.md — included (has an .md file)
+        section_with_index = content_dir / "section"
+        section_with_index.mkdir()
+        (section_with_index / "_index.md").write_text("---\ntitle: Section\n---\n")
 
         # Directory that is truly empty
         bare_dir = content_dir / "bare"
@@ -1675,9 +1728,104 @@ class TestBuildContentTree:
 
         labels = [e["label"] for e in result]
         assert "assets/" not in labels
-        assert "empty/" not in labels
         assert "bare/" not in labels
         assert "page.md" in labels
+        # section/ appears because it has _index.md
+        assert "section/" in labels
+
+    def test_subdir_inherits_parent_cascade(self, tmp_path):
+        """Subdir without its own _index.md inherits cascade from parent _index.md.
+
+        Regression test for Bug 1: _build_content_tree used to check only the
+        subdir's own _index.md for dir_encrypted, ignoring the cascade.
+        """
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        private = content_dir / "private"
+        private.mkdir()
+        (private / "_index.md").write_text(
+            '---\ntitle: Private\nencrypted: true\ngroups:\n  - admin\n---\n'
+        )
+
+        subdir = private / "subdir"
+        subdir.mkdir()
+        # NOTE: subdir has no _index.md of its own — must inherit from parent
+        (subdir / "page.md").write_text("---\ntitle: Page\n---\nContent.\n")
+
+        result = _build_content_tree(content_dir)
+
+        by_label = {e["label"]: e for e in result}
+
+        # private/ shows as encrypted (its own _index.md says so)
+        assert by_label["private/"]["encrypted"] is True
+
+        # private/subdir/ must ALSO show as encrypted (inherited cascade)
+        assert "private/subdir/" in by_label
+        assert by_label["private/subdir/"]["encrypted"] is True
+
+    def test_intermediate_dirs_included(self, tmp_path):
+        """Deeply nested content produces entries for intermediate directories.
+
+        Regression test for Bug 3: ProtectApp._ensure_ancestor used to synthesize
+        intermediate nodes with hardcoded encrypted=False, ignoring cascade.
+        Emitting intermediate dirs here means the TUI doesn't need to synthesize.
+        """
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        private = content_dir / "private"
+        private.mkdir()
+        (private / "_index.md").write_text(
+            '---\ntitle: Private\nencrypted: true\n---\n'
+        )
+
+        # intermediate/ has no .md files or _index.md, only a descendant does
+        intermediate = private / "intermediate"
+        intermediate.mkdir()
+
+        deep = intermediate / "deep"
+        deep.mkdir()
+        (deep / "post.md").write_text("---\ntitle: Post\n---\nContent.\n")
+
+        result = _build_content_tree(content_dir)
+
+        labels = [e["label"] for e in result]
+        # All levels must be present as dir entries
+        assert "private/" in labels
+        assert "private/intermediate/" in labels
+        assert "private/intermediate/deep/" in labels
+
+        # Every dir entry inherits the cascade from private/
+        by_label = {e["label"]: e for e in result}
+        assert by_label["private/"]["encrypted"] is True
+        assert by_label["private/intermediate/"]["encrypted"] is True
+        assert by_label["private/intermediate/deep/"]["encrypted"] is True
+
+    def test_encrypted_false_override_not_shown_as_encrypted(self, tmp_path):
+        """A dir with _index.md 'encrypted: false' opts out of ancestor cascade."""
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+
+        private = content_dir / "private"
+        private.mkdir()
+        (private / "_index.md").write_text(
+            '---\ntitle: Private\nencrypted: true\n---\n'
+        )
+
+        public_sub = private / "public_sub"
+        public_sub.mkdir()
+        (public_sub / "_index.md").write_text(
+            '---\ntitle: Public\nencrypted: false\n---\n'
+        )
+        (public_sub / "page.md").write_text("---\ntitle: Page\n---\nContent.\n")
+
+        result = _build_content_tree(content_dir)
+
+        by_label = {e["label"]: e for e in result}
+        assert by_label["private/"]["encrypted"] is True
+        # explicit opt-out should show as NOT encrypted
+        assert by_label["private/public_sub/"]["encrypted"] is False
 
 
 class TestInteractiveProtect:
@@ -1723,17 +1871,13 @@ class TestInteractiveProtect:
         """Selecting an unprotected file marks it encrypted: true."""
         content, config_path = self._make_site(tmp_path)
 
-        # Tree order: public.md (0, not encrypted), private/ (1, encrypted),
-        #             secret.md (2, encrypted via cascade)
-        # Selecting all three means public.md (index 0) gets newly protected
-        with patch("cryptoid.cli.TerminalMenu") as MockMenu:
-            instance = MagicMock()
-            instance.show.return_value = (0, 1, 2)
-            MockMenu.return_value = instance
+        # ProtectApp.run() returns list of change dicts
+        changes = [{"action": "protect", "path": content / "public.md", "type": "file"}]
+        with patch("cryptoid.cli.ProtectApp") as MockApp:
+            MockApp.return_value.run.return_value = changes
             result = runner.invoke(
                 main,
                 ["protect", "-i", "--config", str(config_path)],
-                input="y\n",
             )
 
         assert result.exit_code == 0
@@ -1744,39 +1888,26 @@ class TestInteractiveProtect:
         """Deselecting a protected directory unprotects it."""
         content, config_path = self._make_site(tmp_path)
 
-        # Tree order: public.md (0, not encrypted), private/ (1, encrypted),
-        #             secret.md (2, encrypted via cascade)
-        # Selecting only public.md means private/ and secret.md get unprotected
-        with patch("cryptoid.cli.TerminalMenu") as MockMenu:
-            instance = MagicMock()
-            instance.show.return_value = (0,)
-            MockMenu.return_value = instance
+        changes = [{"action": "unprotect", "path": content / "private", "type": "dir"}]
+        with patch("cryptoid.cli.ProtectApp") as MockApp:
+            MockApp.return_value.run.return_value = changes
             result = runner.invoke(
                 main,
                 ["protect", "-i", "--config", str(config_path)],
-                input="y\n",
             )
 
         assert result.exit_code == 0
-        # _unprotect_directory removes _index.md when it has no remaining content
-        # beyond title, so the file may be deleted or have encrypted removed
         index_path = content / "private" / "_index.md"
         if index_path.exists():
             index_post = fm.load(str(index_path))
             assert "encrypted" not in index_post.metadata or index_post.metadata.get("encrypted") is not True
-        # If _index.md was deleted, that also means unprotected
 
     def test_interactive_no_changes(self, runner, tmp_path):
-        """When selection matches current state, prints 'No changes'."""
-        content, config_path = self._make_site(tmp_path)
+        """When app returns None (no changes or cancelled), prints 'No changes'."""
+        _, config_path = self._make_site(tmp_path)
 
-        # Tree order: public.md (0, not encrypted), private/ (1, encrypted),
-        #             secret.md (2, encrypted via cascade)
-        # Selecting (1, 2) matches preselected — no change
-        with patch("cryptoid.cli.TerminalMenu") as MockMenu:
-            instance = MagicMock()
-            instance.show.return_value = (1, 2)
-            MockMenu.return_value = instance
+        with patch("cryptoid.cli.ProtectApp") as MockApp:
+            MockApp.return_value.run.return_value = None
             result = runner.invoke(
                 main,
                 ["protect", "-i", "--config", str(config_path)],
@@ -1785,32 +1916,27 @@ class TestInteractiveProtect:
         assert result.exit_code == 0
         assert "No changes" in result.output
 
-    def test_interactive_quit(self, runner, tmp_path):
-        """When menu returns None (cancelled), prints 'Cancelled'."""
-        content, config_path = self._make_site(tmp_path)
+    def test_interactive_empty_changes(self, runner, tmp_path):
+        """When app returns empty list, prints 'No changes'."""
+        _, config_path = self._make_site(tmp_path)
 
-        with patch("cryptoid.cli.TerminalMenu") as MockMenu:
-            instance = MagicMock()
-            instance.show.return_value = None
-            MockMenu.return_value = instance
+        with patch("cryptoid.cli.ProtectApp") as MockApp:
+            MockApp.return_value.run.return_value = []
             result = runner.invoke(
                 main,
                 ["protect", "-i", "--config", str(config_path)],
             )
 
         assert result.exit_code == 0
-        assert "Cancelled" in result.output
+        assert "No changes" in result.output
 
     def test_interactive_with_groups(self, runner, tmp_path):
         """--groups admin applies to newly protected items."""
         content, config_path = self._make_site(tmp_path)
 
-        # Tree order: public.md (0), private/ (1), secret.md (2)
-        # Selecting all three with --groups admin — public.md gets newly protected
-        with patch("cryptoid.cli.TerminalMenu") as MockMenu:
-            instance = MagicMock()
-            instance.show.return_value = (0, 1, 2)
-            MockMenu.return_value = instance
+        changes = [{"action": "protect", "path": content / "public.md", "type": "file"}]
+        with patch("cryptoid.cli.ProtectApp") as MockApp:
+            MockApp.return_value.run.return_value = changes
             result = runner.invoke(
                 main,
                 [
@@ -1818,10 +1944,86 @@ class TestInteractiveProtect:
                     "--config", str(config_path),
                     "--groups", "admin",
                 ],
-                input="y\n",
             )
 
         assert result.exit_code == 0
         post = fm.load(str(content / "public.md"))
         assert post.metadata.get("encrypted") is True
         assert "admin" in post.metadata.get("groups", [])
+
+    def test_interactive_unprotect_inherited_dir_creates_opt_out(
+        self, runner, tmp_path
+    ):
+        """Unprotecting a cascade-inherited dir writes an opt-out _index.md.
+
+        Regression test: previously, unchecking a subdir whose encryption came
+        from a parent _index.md cascade would call _unprotect_directory which
+        prints 'nothing to unprotect' and leaves the dir silently still
+        encrypted. The TUI-specific path must write an _index.md with
+        `encrypted: false` so the uncheck actually takes effect.
+        """
+        content, config_path = self._make_site(tmp_path)
+
+        # Add a cascade-inherited subdir with no own _index.md
+        inherited = content / "private" / "subdir"
+        inherited.mkdir()
+        (inherited / "page.md").write_text("---\ntitle: Page\n---\nContent.\n")
+
+        changes = [{"action": "unprotect", "path": inherited, "type": "dir"}]
+        with patch("cryptoid.cli.ProtectApp") as MockApp:
+            MockApp.return_value.run.return_value = changes
+            result = runner.invoke(
+                main,
+                ["protect", "-i", "--config", str(config_path)],
+            )
+
+        assert result.exit_code == 0
+        opt_out_index = inherited / "_index.md"
+        assert opt_out_index.exists()
+        post = fm.load(str(opt_out_index))
+        assert post.metadata.get("encrypted") is False
+
+    def test_interactive_unprotect_own_index_delegates_to_regular_unprotect(
+        self, runner, tmp_path
+    ):
+        """Unprotecting a dir with its own _index.md clears encryption fields."""
+        content, config_path = self._make_site(tmp_path)
+
+        changes = [
+            {"action": "unprotect", "path": content / "private", "type": "dir"}
+        ]
+        with patch("cryptoid.cli.ProtectApp") as MockApp:
+            MockApp.return_value.run.return_value = changes
+            result = runner.invoke(
+                main,
+                ["protect", "-i", "--config", str(config_path)],
+            )
+
+        assert result.exit_code == 0
+        index = content / "private" / "_index.md"
+        if index.exists():
+            post = fm.load(str(index))
+            assert post.metadata.get("encrypted") is not True
+
+    def test_interactive_no_content_dir_gives_clear_error(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """Running `protect -i` without any resolvable content_dir gives a
+        friendly message mentioning the available options.
+
+        Regression test for the config-fallback UX: previously the user saw
+        the generic _resolve_content_dir error even though the fallback path
+        claimed env vars would be tried.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("CRYPTOID_CONTENT_DIR", raising=False)
+        # No .cryptoid.yaml in tmp_path, no env var, no --content-dir
+
+        # Must not open the TUI — we expect an early exit
+        with patch("cryptoid.cli.ProtectApp") as MockApp:
+            result = runner.invoke(main, ["protect", "-i"])
+            MockApp.assert_not_called()
+
+        assert result.exit_code != 0
+        assert "protect -i" in result.output
+        assert "content" in result.output.lower()

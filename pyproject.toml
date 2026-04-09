@@ -29,7 +29,7 @@ dependencies = [
     "click>=8.0.0",
     "pyyaml>=6.0",
     "python-frontmatter>=1.0.0",
-    "simple-term-menu>=1.6.0",
+    "textual>=0.50.0",
 ]
 
 [project.optional-dependencies]

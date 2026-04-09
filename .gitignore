@@ -42,3 +42,7 @@ htmlcov/
 # Cryptoid config (contains passwords!)
 .cryptoid.yaml
 .cryptoid.yml
+
+# Tool artifacts
+.playwright-mcp/
+.serena/
