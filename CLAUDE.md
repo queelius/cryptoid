@@ -34,7 +34,7 @@ cryptoid status  --content-dir content/ --config .cryptoid.yaml [--verbose]
 cryptoid rewrap  --content-dir content/ --config .cryptoid.yaml [--rekey]
 cryptoid protect  content/private/ --groups team [--hint "..."] [--remember ask]
 cryptoid protect  -i [--config .cryptoid.yaml]                       # interactive Textual TUI
-cryptoid unprotect content/private/
+cryptoid unprotect content/private/ [--config .cryptoid.yaml]        # --config enables cascade-aware unprotect
 cryptoid hugo status|install|uninstall
 ```
 
@@ -42,7 +42,7 @@ cryptoid hugo status|install|uninstall
 
 ### Cross-platform crypto contract
 
-The Python (`src/cryptoid/crypto.py`) and JavaScript (`hugo/assets/js/cryptoid.js`) implementations must produce identical cryptographic results. They share these parameters:
+The Python (`src/cryptoid/crypto.py`) and JavaScript (`hugo/static/js/cryptoid.js`) implementations must produce identical cryptographic results. They share these parameters:
 
 - AES-256-GCM encryption, PBKDF2-SHA256 key derivation, 310,000 iterations
 - 16-byte salt, 12-byte IV, 32-byte CEK (content encryption key)
@@ -58,10 +58,10 @@ The Python (`src/cryptoid/crypto.py`) and JavaScript (`hugo/assets/js/cryptoid.j
 
 - **`src/cryptoid/crypto.py`** — v2 encryption/decryption with multi-user key wrapping, CEK management, PBKDF2 key derivation, `rewrap_keys()` for user set changes, content hashing. Custom `CryptoidError` exception for all crypto failures.
 - **`src/cryptoid/frontmatter.py`** — Parses markdown front matter to extract `EncryptionConfig` dataclass (encrypted, groups, password_hint, remember). Detects whether a file should be encrypted or is already encrypted (via shortcode regex).
-- **`src/cryptoid/cli.py`**: Click CLI with commands `init`, `config` (status, show, validate, init-global, list-users, add-user, remove-user, list-groups, add-group, remove-group, add-to-group, remove-from-group, generate-salt), `encrypt`, `decrypt`, `status`, `rewrap`, `protect` (supports `-i`/`--interactive` Textual TUI), `unprotect`, `hugo` (status, install, uninstall). Handles config loading from `.cryptoid.yaml` (users, groups, salt), `_index.md` cascade resolution, group-to-user resolution with admin injection, and file processing logic.
+- **`src/cryptoid/cli.py`**: Click CLI with commands `init` (accepts `--global` for the user-wide config), `config` (status, show, validate, list-users, add-user, remove-user, list-groups, add-group, remove-group, add-to-group, remove-from-group, set-content-dir, set-admin, generate-salt), `encrypt`, `decrypt`, `status`, `rewrap`, `protect` (supports `-i`/`--interactive` Textual TUI), `unprotect` (cascade-aware when `--config`/`--content-dir` resolves a content root), `hugo` (status, install, uninstall). Handles config loading from `.cryptoid.yaml` (users, groups, salt), `_index.md` cascade resolution, group-to-user resolution with admin injection, and file processing logic. Cascade walking is centralized in `_walk_cascade_from(start_dir, content_dir)`, used by `resolve_encryption()` (file state, after checking own front matter), `_build_content_tree()` (directory state in the TUI), and `_unprotect_directory()` (to detect parent-cascade inheritance and write an explicit `encrypted: false` opt-out). Treat that function as the single source of truth for cascade semantics; do not reimplement cascade walking elsewhere.
 - **`src/cryptoid/tui.py`**: Textual-based interactive tree view (`ProtectApp`) for `cryptoid protect -i`. Lets the user browse the content tree and toggle encryption on files and directories with cascade-aware display state.
 - **`hugo/layouts/shortcodes/cryptoid-encrypted.html`** — Hugo shortcode with `mode="user"` parameter, renders username+password form, embeds ciphertext.
-- **`hugo/assets/js/cryptoid.js`** — Browser-side v2 decryption (key blob iteration, CEK unwrapping), credential storage (JSON `{u,p}` in localStorage/sessionStorage), and basic markdown rendering.
+- **`hugo/static/js/cryptoid.js`** — Browser-side v2 decryption (key blob iteration, CEK unwrapping), credential storage (JSON `{u,p}` in localStorage/sessionStorage), and basic markdown rendering.
 
 ### Encryption flow
 
@@ -88,11 +88,15 @@ Rules: `_index.md` bodies are encrypted like any other file (front matter stays 
 
 Users, groups, and optional salt are in `.cryptoid.yaml` (gitignored). Files reference groups via `groups` front matter field (list of group names). The special `admin` group always gets access to all encrypted content. The `remember` field controls browser credential storage: `"none"`, `"session"`, `"local"`, or `"ask"`.
 
+Two-tier config: a global config at `$XDG_CONFIG_HOME/cryptoid/config.yaml` (defaulting to `~/.config/cryptoid/config.yaml`) merges with the local `.cryptoid.yaml`. Merge rules: `users` from local override global on key collision; `groups` and `salt` are local-only (no merging). Resolution priority for `content_dir`: CLI flag > `CRYPTOID_CONTENT_DIR` env var > local config > global config. `_load_global_config()` is the canonical reader (called from `load_config()` plus several mutator commands like `add-user` and `remove-user` for cross-tier validation). Bootstrap a global config with `cryptoid init --global`. Inspect with `cryptoid config status` (paths) or `cryptoid config show` (contents, with `--show-passwords` to unmask).
+
 ## Conventions
 
 - Python 3.10+ with `|` union syntax for type hints
 - `pathlib.Path` for all file system operations
 - `CryptoidError` for all user-facing errors from the crypto module
 - Tests use `tmp_path` fixtures; test Hugo site fixtures live in `tests/fixtures/hugo-site/`
-- Encryption is idempotent — `encrypt_file` skips already-encrypted files
-- `_index.md` files are never encrypted themselves, only used for cascade
+- Encryption is idempotent: `encrypt_file` skips already-encrypted files (detected by shortcode regex in `is_already_encrypted`)
+- Version string lives in BOTH `pyproject.toml` and `src/cryptoid/__init__.py`. Keep them in sync; nothing enforces this automatically and a mismatch is silently shippable
+- `tests/test_tui.py` only covers pure helpers (`_cascade_check`, `_checkbox`, `_collect_leaf_states`, etc.). The live `ProtectApp` is not driven in tests; CLI-level interactive behavior is covered in `test_cli.py::TestInteractiveProtect` by mocking `cryptoid.cli.ProtectApp`
+- Build backend is `hatchling`; install for dev with `pip install -e ".[dev]"`

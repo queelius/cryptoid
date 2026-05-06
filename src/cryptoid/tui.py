@@ -151,20 +151,6 @@ def _collect_leaf_states(node: TreeNode[ContentEntry]) -> set[bool]:
     return states
 
 
-# Backward-compatible aliases for tests
-def _update_label(node: TreeNode[ContentEntry]) -> None:
-    """No-op — labels are rendered dynamically via render_label()."""
-    pass
-
-
-def _update_ancestors(node: TreeNode[ContentEntry]) -> None:
-    """Alias for _sync_ancestor_checked."""
-    _sync_ancestor_checked(node)
-
-
-_update_parent_label = _update_ancestors
-
-
 class ProtectApp(App[list[dict[str, Any]] | None]):
     """Interactive content tree for selecting files to protect/unprotect."""
 
@@ -216,15 +202,16 @@ class ProtectApp(App[list[dict[str, Any]] | None]):
         tree: ContentTree,
         dir_nodes: dict[Path, TreeNode[ContentEntry]],
     ) -> TreeNode[ContentEntry]:
-        """Ensure parent_path exists as a tree node, creating intermediates.
+        """Look up an existing parent tree node, or synthesize one as a fallback.
 
-        Under the current design, `_build_content_tree` pre-emits entries for
-        every intermediate directory, so this method's synthesis path is a
-        defensive fallback for directories that fall outside the expected
-        hierarchy (e.g. symlink weirdness, a content_dir mismatch). Synthesized
-        nodes use `encrypted=False` as a safe default — treating unknown state
-        as "not encrypted" means the user sees the checkbox unchecked and must
-        explicitly opt in, which avoids accidental unprotects.
+        `_build_content_tree` pre-emits entries for every intermediate directory,
+        so the normal lookup path (`parent_path in dir_nodes`) handles every dir
+        that has any descendant `.md` file. The recursive synthesis branch is a
+        defensive fallback for paths outside the expected hierarchy (symlink
+        weirdness, a content_dir mismatch). Synthesized nodes use
+        `encrypted=False` as a safe default — treating unknown state as "not
+        encrypted" means the user must explicitly opt in, avoiding accidental
+        unprotects.
         """
         if parent_path in dir_nodes:
             return dir_nodes[parent_path]

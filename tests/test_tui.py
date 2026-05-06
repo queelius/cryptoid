@@ -10,9 +10,7 @@ from cryptoid.tui import (
     _checkbox,
     _checkbox_mixed,
     _collect_leaf_states,
-    _update_ancestors,
-    _update_label,
-    _update_parent_label,
+    _sync_ancestor_checked,
 )
 
 
@@ -226,8 +224,8 @@ class TestCascadeCheck:
         assert child2.data.checked is False
 
 
-class TestUpdateAncestors:
-    """Test _update_ancestors propagates up through all ancestor dirs."""
+class TestSyncAncestorChecked:
+    """Test _sync_ancestor_checked propagates up through all ancestor dirs."""
 
     def test_updates_immediate_parent(self):
         parent = MagicMock()
@@ -246,7 +244,7 @@ class TestUpdateAncestors:
         # Parent has one child (the one being toggled) which is unchecked
         parent.children = [child]
 
-        _update_ancestors(child)
+        _sync_ancestor_checked(child)
         assert parent.data.checked is False
 
     def test_propagates_to_grandparent(self):
@@ -273,13 +271,9 @@ class TestUpdateAncestors:
         parent.children = [child]
         grandparent.children = [parent]
 
-        _update_ancestors(child)
+        _sync_ancestor_checked(child)
         assert parent.data.checked is False
         assert grandparent.data.checked is False
-
-    def test_backward_compat_alias(self):
-        """_update_parent_label is an alias for _update_ancestors."""
-        assert _update_parent_label is _update_ancestors
 
 
 class TestContentEntry:

@@ -2027,3 +2027,157 @@ class TestInteractiveProtect:
         assert result.exit_code != 0
         assert "protect -i" in result.output
         assert "content" in result.output.lower()
+
+    def test_interactive_unprotect_inherited_dir_with_existing_index(
+        self, runner, tmp_path
+    ):
+        """Unprotecting a cascade-inherited dir whose own _index.md has NO
+        `encrypted` field must still write the explicit opt-out.
+
+        Regression test for a code-review finding: the previous
+        `_tui_unprotect_directory` only handled "no _index.md exists" by
+        creating an opt-out file. If the dir had a `title:`-only _index.md
+        AND inherited cascade encryption from a parent, the helper delegated
+        to `_unprotect_directory`, which printed "nothing to unprotect"
+        because no `encrypted` field was present. The user's TUI uncheck
+        silently failed and the dir stayed cascade-encrypted.
+        """
+        content, config_path = self._make_site(tmp_path)
+
+        # Cascade-inherited subdir with a non-encryption _index.md
+        inherited = content / "private" / "with_index"
+        inherited.mkdir()
+        (inherited / "_index.md").write_text(
+            "---\ntitle: Inherited Section\nweight: 5\n---\n"
+        )
+        (inherited / "page.md").write_text("---\ntitle: Page\n---\nContent.\n")
+
+        changes = [{"action": "unprotect", "path": inherited, "type": "dir"}]
+        with patch("cryptoid.cli.ProtectApp") as MockApp:
+            MockApp.return_value.run.return_value = changes
+            result = runner.invoke(
+                main,
+                ["protect", "-i", "--config", str(config_path)],
+            )
+
+        assert result.exit_code == 0, result.output
+
+        # The existing _index.md must now have explicit encrypted: false,
+        # and other front matter (title, weight) must be preserved.
+        post = fm.load(str(inherited / "_index.md"))
+        assert post.metadata.get("encrypted") is False
+        assert post.metadata.get("title") == "Inherited Section"
+        assert post.metadata.get("weight") == 5
+
+
+class TestUnprotectDirectoryEncryptedBody:
+    """Refuse to unprotect a directory whose _index.md body is encrypted."""
+
+    def test_refuses_encrypted_index_md_body(self, runner, tmp_path):
+        """Under v2 semantics, _index.md bodies can be encrypted. Stripping
+        front matter without first decrypting would leave a half-state file
+        (encrypted body + plaintext front matter). The CLI must refuse and
+        point at `cryptoid decrypt`.
+        """
+        content = tmp_path / "content"
+        content.mkdir()
+
+        private = content / "private"
+        private.mkdir()
+        # Simulate an already-encrypted _index.md body (the shortcode is what
+        # `is_already_encrypted` looks for).
+        (private / "_index.md").write_text(
+            "---\ntitle: Private\nencrypted: true\n---\n"
+            "{{< cryptoid-encrypted ciphertext=\"abc==\" hash=\"deadbeef\" >}}\n"
+        )
+
+        result = runner.invoke(main, ["unprotect", str(private)])
+
+        assert result.exit_code != 0
+        assert "decrypt" in result.output.lower()
+        # The _index.md must be untouched (encrypted: true still there)
+        post = fm.load(str(private / "_index.md"))
+        assert post.metadata.get("encrypted") is True
+
+
+class TestUnprotectCliCascadeAware:
+    """`cryptoid unprotect <dir>` is cascade-aware when --content-dir/--config
+    is provided, so the CLI matches the TUI's behavior (architect's
+    asymmetry-removal recommendation)."""
+
+    def _make_site(self, tmp_path):
+        content = tmp_path / "content"
+        content.mkdir()
+        priv = content / "private"
+        priv.mkdir()
+        (priv / "_index.md").write_text(
+            "---\ntitle: Private\nencrypted: true\ngroups:\n  - team\n---\n"
+        )
+        config_path = tmp_path / ".cryptoid.yaml"
+        config_path.write_text(
+            "users:\n  alice: pwd\n"
+            "groups:\n  team:\n    - alice\n"
+            "salt: aa11bb22cc33dd44ee55ff6677889900\n"
+            f"content_dir: {content}\n"
+        )
+        return content, config_path
+
+    def test_cli_unprotect_inherited_dir_creates_opt_out(self, runner, tmp_path):
+        """`cryptoid unprotect <inherited-subdir> --config <path>` writes an
+        opt-out _index.md instead of silently no-op'ing."""
+        content, config_path = self._make_site(tmp_path)
+        inherited = content / "private" / "subdir"
+        inherited.mkdir()
+        (inherited / "page.md").write_text("---\ntitle: Page\n---\nContent.\n")
+
+        result = runner.invoke(
+            main, ["unprotect", str(inherited), "--config", str(config_path)]
+        )
+
+        assert result.exit_code == 0, result.output
+        opt_out = inherited / "_index.md"
+        assert opt_out.exists()
+        post = fm.load(str(opt_out))
+        assert post.metadata.get("encrypted") is False
+
+    def test_cli_unprotect_no_config_fallback_old_behavior(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """Without --config/--content-dir and no env var, `cryptoid unprotect`
+        falls back to the legacy non-cascade-aware behavior (no _index.md →
+        'nothing to unprotect')."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("CRYPTOID_CONTENT_DIR", raising=False)
+
+        plain = tmp_path / "plain_dir"
+        plain.mkdir()
+        (plain / "page.md").write_text("---\ntitle: Page\n---\n")
+
+        result = runner.invoke(main, ["unprotect", str(plain)])
+
+        assert result.exit_code == 0, result.output
+        assert "nothing to unprotect" in result.output.lower()
+        # No _index.md should be written
+        assert not (plain / "_index.md").exists()
+
+    def test_cli_unprotect_synthesized_index_omits_title(
+        self, runner, tmp_path
+    ):
+        """The opt-out _index.md created by cascade-aware unprotect should NOT
+        synthesize an ugly title from the directory name. Hugo can derive
+        titles itself; we only need `encrypted: false` for the cascade
+        opt-out."""
+        content, config_path = self._make_site(tmp_path)
+        inherited = content / "private" / "2024-09-posts"
+        inherited.mkdir()
+        (inherited / "page.md").write_text("---\ntitle: Page\n---\n")
+
+        result = runner.invoke(
+            main, ["unprotect", str(inherited), "--config", str(config_path)]
+        )
+
+        assert result.exit_code == 0, result.output
+        post = fm.load(str(inherited / "_index.md"))
+        # title should NOT be auto-derived as "2024 09 Posts"
+        assert "title" not in post.metadata
+        assert post.metadata.get("encrypted") is False

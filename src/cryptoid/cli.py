@@ -2462,33 +2462,6 @@ def rewrap(content_dir: Path | None, config_path: Path, rekey: bool):
 # =============================================================================
 
 
-def _tui_unprotect_directory(dir_path: Path) -> None:
-    """Unprotect a directory from the TUI, handling the cascade-inherited case.
-
-    If the directory has its own `_index.md`, delegate to `_unprotect_directory`
-    which clears its encryption fields.
-
-    If the directory has no `_index.md`, it is being unprotected because the
-    TUI showed it as encrypted via inherited cascade from a parent. In that
-    case, create a minimal `_index.md` with `encrypted: false` so the directory
-    explicitly opts out of the inherited cascade. Without this, the user's
-    uncheck in the TUI would silently have no effect.
-    """
-    index_path = dir_path / "_index.md"
-    if index_path.exists():
-        _unprotect_directory(dir_path)
-        return
-
-    post = frontmatter.Post("")
-    post.metadata["title"] = (
-        dir_path.name.replace("-", " ").replace("_", " ").title()
-    )
-    post.metadata["encrypted"] = False
-    index_path.write_text(frontmatter.dumps(post), encoding="utf-8")
-    click.echo(f"Created {index_path}")
-    click.echo("  encrypted: false (explicit opt-out from inherited cascade)")
-
-
 def _interactive_protect(
     config: dict[str, Any],
     groups: tuple[str, ...],
@@ -2496,11 +2469,13 @@ def _interactive_protect(
     remember: str | None,
 ) -> None:
     """Browse content tree and interactively select items to protect/unprotect."""
-    try:
-        content_dir = _resolve_content_dir(None, config)
-    except SystemExit:
-        # _resolve_content_dir calls sys.exit(1) if no content_dir could be
-        # resolved. Re-emit a clearer message pointing at the interactive flow.
+    import os
+
+    # Pre-check whether _resolve_content_dir would have a source to use.
+    # If not, emit an interactive-flow-specific error instead of the generic one.
+    has_env = bool(os.environ.get("CRYPTOID_CONTENT_DIR"))
+    has_config = bool(config and "content_dir" in config)
+    if not (has_env or has_config):
         click.echo(
             "Error: cannot run 'cryptoid protect -i' without a content "
             "directory.\n"
@@ -2509,6 +2484,8 @@ def _interactive_protect(
             err=True,
         )
         sys.exit(1)
+
+    content_dir = _resolve_content_dir(None, config)
 
     entries = _build_content_tree(content_dir)
 
@@ -2543,7 +2520,7 @@ def _interactive_protect(
                 _protect_file(change["path"], groups, hint, remember)
         else:
             if change["type"] == "dir":
-                _tui_unprotect_directory(change["path"])
+                _unprotect_directory(change["path"], content_dir=content_dir)
             else:
                 _unprotect_file(change["path"])
 
@@ -2698,26 +2675,56 @@ def _protect_file(
 
 @main.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
-def unprotect(path: Path):
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=".cryptoid.yaml",
+    help="Path to .cryptoid.yaml; used to resolve content_dir for cascade-aware unprotect",
+)
+@click.option(
+    "--content-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Hugo content directory (default: from config or env var)",
+)
+def unprotect(path: Path, config_path: Path | None, content_dir: Path | None):
     """Remove encryption marking from a file or directory.
 
     If PATH is a directory, updates its _index.md to disable the encryption
     cascade. If PATH is a file, sets encrypted: false in its front matter
     (this also overrides any inherited cascade).
 
-    This does not decrypt content — use 'cryptoid decrypt' first if the
+    When a content_dir is resolvable (via --content-dir, --config, or
+    CRYPTOID_CONTENT_DIR), directory unprotect is cascade-aware: a directory
+    encrypted only via inherited cascade gets a fresh `_index.md` with
+    `encrypted: false` so the unprotect actually takes effect.
+
+    This does not decrypt content. Use 'cryptoid decrypt' first if the
     file is already encrypted.
 
     Examples:
 
-        cryptoid unprotect content/private/
+        cryptoid unprotect content/private/ --config .cryptoid.yaml
 
         cryptoid unprotect content/secret.md
     """
     path = path.resolve()
 
+    # Best-effort content_dir resolution: missing config is fine, the helper
+    # falls back to non-cascade-aware behavior when content_dir is None.
+    resolved_content_dir: Path | None = None
+    try:
+        config = load_config(config_path)
+    except (FileNotFoundError, CryptoidError):
+        config = {}
+    try:
+        resolved_content_dir = _resolve_content_dir(content_dir, config)
+    except SystemExit:
+        resolved_content_dir = None
+
     if path.is_dir():
-        _unprotect_directory(path)
+        _unprotect_directory(path, content_dir=resolved_content_dir)
     elif path.is_file() and path.suffix == ".md":
         _unprotect_file(path)
     else:
@@ -2725,36 +2732,113 @@ def unprotect(path: Path):
         sys.exit(1)
 
 
-def _unprotect_directory(dir_path: Path) -> None:
-    """Update _index.md to disable encryption cascade."""
+def _unprotect_directory(
+    dir_path: Path, content_dir: Path | None = None
+) -> None:
+    """Disable encryption for a directory, cascade-aware when content_dir is given.
+
+    Behavior depends on what's at `dir_path` and on cascade state from the
+    parent (when `content_dir` is provided):
+
+    - If `_index.md` exists and its body is already encrypted: refuse with a
+      pointer to `cryptoid decrypt`. Stripping front matter alone would leave
+      a half-state file (encrypted body + plaintext front matter saying
+      `encrypted: false`).
+    - If `_index.md` exists with own `encrypted` field: clear the encryption
+      fields. If a parent _index.md still cascades encryption down, also
+      write `encrypted: false` to opt this directory out.
+    - If `_index.md` exists without an `encrypted` field BUT the directory is
+      cascade-encrypted from a parent: add `encrypted: false` to the existing
+      front matter (preserving title, weight, etc.).
+    - If `_index.md` doesn't exist BUT the directory is cascade-encrypted from
+      a parent: create a minimal `_index.md` with just `encrypted: false`.
+      No title is synthesized; Hugo derives titles from filenames otherwise.
+    - Otherwise: print "nothing to unprotect" (legacy behavior).
+
+    The cascade-from-parent check uses `_walk_cascade_from(dir_path.parent, ...)`
+    so the directory's own `_index.md` doesn't falsely satisfy the check.
+
+    Args:
+        dir_path: Directory to unprotect.
+        content_dir: Hugo content root. If None, the function falls back to
+            non-cascade-aware behavior (legacy path-based `cryptoid unprotect`
+            without a config).
+    """
     index_path = dir_path / "_index.md"
 
-    if not index_path.exists():
+    parent_inherits = (
+        content_dir is not None
+        and dir_path != content_dir
+        and _walk_cascade_from(dir_path.parent, content_dir) is not None
+    )
+
+    if index_path.exists():
+        content = index_path.read_text(encoding="utf-8")
+
+        if is_already_encrypted(content):
+            click.echo(
+                f"Warning: {index_path} is currently encrypted. "
+                "Run 'cryptoid decrypt' first, then unprotect.",
+                err=True,
+            )
+            sys.exit(1)
+
+        post = frontmatter.loads(content)
+        had_own_encryption = "encrypted" in post.metadata
+
+        if had_own_encryption:
+            post.metadata.pop("encrypted", None)
+            post.metadata.pop("groups", None)
+            post.metadata.pop("password_hint", None)
+            post.metadata.pop("remember", None)
+
+        if parent_inherits:
+            post.metadata["encrypted"] = False
+
+        if not (had_own_encryption or parent_inherits):
+            click.echo(
+                f"{index_path} has no encryption settings — nothing to unprotect"
+            )
+            return
+
+        # If front matter is now empty (or just `title`) and body is empty,
+        # remove the file entirely. Only safe when we're NOT writing an
+        # explicit cascade opt-out (the file's whole purpose then).
+        remaining_meta = {k: v for k, v in post.metadata.items() if k != "title"}
+        if (
+            not parent_inherits
+            and not remaining_meta
+            and not post.content.strip()
+        ):
+            index_path.unlink()
+            click.echo(f"Removed {index_path} (no remaining content)")
+        else:
+            index_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+            click.echo(f"Updated {index_path}")
+            if parent_inherits:
+                click.echo(
+                    "  encrypted: false (explicit opt-out from inherited cascade)"
+                )
+            else:
+                click.echo("  Encryption settings removed")
+    elif parent_inherits:
+        # No _index.md, but cascade-inherited — create opt-out file.
+        # Use exclusive-create to close the TOCTOU window from the existence
+        # check above; if another process raced us, retry the whole flow so
+        # we honor whatever they wrote.
+        post = frontmatter.Post("")
+        post.metadata["encrypted"] = False
+        try:
+            with open(index_path, "x", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+        except FileExistsError:
+            _unprotect_directory(dir_path, content_dir)
+            return
+        click.echo(f"Created {index_path}")
+        click.echo("  encrypted: false (explicit opt-out from inherited cascade)")
+    else:
         click.echo(f"No _index.md found in {dir_path} — nothing to unprotect")
         return
-
-    content = index_path.read_text(encoding="utf-8")
-    post = frontmatter.loads(content)
-
-    if "encrypted" not in post.metadata:
-        click.echo(f"{index_path} has no encryption settings — nothing to unprotect")
-        return
-
-    # Remove encryption-related fields
-    post.metadata.pop("encrypted", None)
-    post.metadata.pop("groups", None)
-    post.metadata.pop("password_hint", None)
-    post.metadata.pop("remember", None)
-
-    # If _index.md has no remaining meaningful content, remove it
-    remaining_meta = {k: v for k, v in post.metadata.items() if k != "title"}
-    if not remaining_meta and not post.content.strip():
-        index_path.unlink()
-        click.echo(f"Removed {index_path} (no remaining content)")
-    else:
-        index_path.write_text(frontmatter.dumps(post), encoding="utf-8")
-        click.echo(f"Updated {index_path}")
-        click.echo("  Encryption settings removed")
 
     click.echo()
     click.echo("Files in this directory will no longer inherit encryption.")
