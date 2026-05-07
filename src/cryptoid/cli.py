@@ -93,9 +93,11 @@ def _load_global_config() -> dict[str, Any]:
 def load_config(config_path: Path | None = None) -> dict[str, Any]:
     """Load cryptoid configuration, merging global and local configs.
 
-    Merge semantics:
-        - users: union, local wins on password conflict (with warning)
-        - groups: union of members for same-named groups (additive)
+    Merge semantics (local always wins on conflict, no additive merging):
+        - users: union of usernames; local wins on password conflict (warned)
+        - groups: same-named local group fully replaces same-named global
+          group (members are NOT unioned). Mirrors the file-level cascade
+          rule that a file's `groups` fully replaces inherited groups.
         - salt: local overrides global
         - content_dir: local overrides global
         - admin: local overrides global
@@ -152,28 +154,25 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
 
     config["users"] = {str(k): str(v) for k, v in merged_users.items()}
 
-    # Merge groups (additive union of members for same-named groups)
+    # Merge groups: local replaces global for same-named groups, mirroring
+    # the file-level cascade rule. A group only present in global is kept;
+    # a group only present in local is kept; a group in both takes its
+    # members from local exclusively (no member-level union).
     global_groups = global_config.get("groups", {})
     local_groups = config.get("groups", {})
     merged_groups: dict[str, list[str]] = {}
 
     all_group_names = set(global_groups.keys()) | set(local_groups.keys())
     for group_name in all_group_names:
-        global_members = global_groups.get(group_name, [])
-        local_members = local_groups.get(group_name, [])
-        if not isinstance(global_members, list):
-            raise CryptoidError(f"Global group '{group_name}' members must be a list")
-        if not isinstance(local_members, list):
-            raise CryptoidError(f"Group '{group_name}' members must be a list")
-        # Union of members, preserving order (local first, then global additions)
-        seen = set()
-        combined = []
-        for member in list(local_members) + list(global_members):
-            m = str(member)
-            if m not in seen:
-                seen.add(m)
-                combined.append(m)
-        merged_groups[group_name] = combined
+        if group_name in local_groups:
+            members = local_groups[group_name]
+        else:
+            members = global_groups[group_name]
+        if not isinstance(members, list):
+            raise CryptoidError(
+                f"Group '{group_name}' members must be a list"
+            )
+        merged_groups[group_name] = [str(m) for m in members]
 
     # Validate group members exist in merged users
     for group_name, members in merged_groups.items():

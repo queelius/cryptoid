@@ -1298,8 +1298,12 @@ class TestGlobalConfig:
         assert "alice" in config["users"]
         assert config["users"]["alice"] == "global-pass"
 
-    def test_groups_merged_additively(self, tmp_path, monkeypatch):
-        """Same-named groups get union of members from global + local."""
+    def test_local_group_fully_replaces_global_group(self, tmp_path, monkeypatch):
+        """Same-named local group replaces global group; members do NOT union.
+
+        Mirrors the file-level cascade rule that a file's `groups` field
+        fully replaces inherited groups.
+        """
         self._setup_global(
             tmp_path, monkeypatch,
             users={"alice": "pass-a"},
@@ -1319,8 +1323,33 @@ class TestGlobalConfig:
         from cryptoid.cli import load_config
 
         config = load_config(local_config)
-        assert "alice" in config["groups"]["admin"]
-        assert "bob" in config["groups"]["admin"]
+        # Local replaces global: only bob, not alice
+        assert config["groups"]["admin"] == ["bob"]
+
+    def test_global_only_group_preserved(self, tmp_path, monkeypatch):
+        """A group defined only in global (not in local) is still merged."""
+        self._setup_global(
+            tmp_path, monkeypatch,
+            users={"alice": "pass-a"},
+            groups={"admin": ["alice"], "team": ["alice"]},
+        )
+
+        local_config = tmp_path / ".cryptoid.yaml"
+        local_config.write_text(
+            yaml.dump({
+                "users": {"bob": "pass-b"},
+                "groups": {"admin": ["bob"]},  # only redefines admin
+                "salt": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+            }),
+            encoding="utf-8",
+        )
+
+        from cryptoid.cli import load_config
+
+        config = load_config(local_config)
+        # admin is replaced by local; team is only in global, preserved as-is
+        assert config["groups"]["admin"] == ["bob"]
+        assert config["groups"]["team"] == ["alice"]
 
     def test_global_only_groups(self, tmp_path, monkeypatch):
         """Groups from global are used when local has none."""
@@ -2188,8 +2217,13 @@ class TestConfigShowEdgeCases:
         )
         assert result.exit_code == 0
 
-    def test_show_merged_groups_union(self, runner, tmp_path, monkeypatch):
-        """Same group name in global+local shows union of members."""
+    def test_show_local_group_replaces_global(self, runner, tmp_path, monkeypatch):
+        """Same group name in global+local: local replaces global (no union).
+
+        With users alice (global) and bob (local), and admin defined in both,
+        admin's members are exactly the local list. alice is still a known
+        user (from the global users tier), but is no longer in admin.
+        """
         config_home = tmp_path / "xdg"
         cryptoid_dir = config_home / "cryptoid"
         cryptoid_dir.mkdir(parents=True)
@@ -2205,14 +2239,14 @@ class TestConfigShowEdgeCases:
             "groups": {"admin": ["bob"]},
             "salt": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
         }))
-        result = runner.invoke(
-            main,
-            ["config", "show", "--config", str(config_path)],
-        )
-        assert result.exit_code == 0
-        # Both alice and bob should appear in admin group
-        assert "alice" in result.output
-        assert "bob" in result.output
+
+        from cryptoid.cli import load_config
+
+        cfg = load_config(config_path)
+        assert cfg["groups"]["admin"] == ["bob"]
+        # alice still exists as a user (cross-tier user union still applies)
+        assert "alice" in cfg["users"]
+        assert "bob" in cfg["users"]
 
 
 # =============================================================================
